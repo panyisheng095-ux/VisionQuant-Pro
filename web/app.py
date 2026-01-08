@@ -1,0 +1,883 @@
+import streamlit as st
+import os
+import sys
+import pandas as pd
+import numpy as np
+import mplfinance as mpf
+import plotly.graph_objects as go
+from datetime import datetime
+import pickle
+from streamlit_mic_recorder import mic_recorder
+
+# ================= 路径与环境配置 =================
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+try:
+    from src.data.data_loader import DataLoader
+    from src.data.news_harvester import NewsHarvester
+    from src.models.vision_engine import VisionEngine
+    from src.strategies.factor_mining import FactorMiner
+    from src.strategies.fundamental import FundamentalMiner
+    from src.agent.quant_agent import QuantAgent
+    from src.utils.visualizer import create_comparison_plot
+    from src.utils.pdf_generator import generate_report_pdf
+    from src.utils.audio_manager import AudioManager
+    from src.strategies.batch_analyzer import BatchAnalyzer
+    from src.strategies.portfolio_optimizer import PortfolioOptimizer
+except ImportError as e:
+    st.error(f"❌ 系统模块加载失败: {e}. 请确保 src 目录下文件完整。")
+    st.stop()
+
+# ================= 页面配置 =================
+st.set_page_config(page_title="VisionQuant Pro", layout="wide", page_icon="🦄")
+
+st.markdown("""
+    <style>
+    .main { background-color: #f8f9fa; }
+    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; border: 1px solid #e6e9ef; }
+    /* 核心决策框样式 */
+    .agent-box { border-left: 5px solid #ff4b4b; padding: 20px; background-color: #fff1f1; border-radius: 5px; margin-bottom: 20px; }
+    /* 聊天气泡 */
+    .stChatMessage { background-color: #ffffff; border-radius: 12px; padding: 12px; margin-bottom: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    </style>
+""", unsafe_allow_html=True)
+
+
+# ================= 引擎初始化 =================
+@st.cache_resource
+def load_all_engines():
+    v = VisionEngine()
+    v.reload_index()
+    return {
+        "loader": DataLoader(), "vision": v, "factor": FactorMiner(),
+        "fund": FundamentalMiner(), "agent": QuantAgent(), "news": NewsHarvester(),
+        "audio": AudioManager()
+    }
+
+
+eng = load_all_engines()
+
+# === Session State 初始化 ===
+if "chat_history" not in st.session_state: st.session_state.chat_history = []
+if "last_context" not in st.session_state: st.session_state.last_context = ""
+if "has_run" not in st.session_state: st.session_state.has_run = False
+# 新增：防复读锁
+if "last_voice_text" not in st.session_state: st.session_state.last_voice_text = ""
+# 批量分析结果缓存
+if "batch_results" not in st.session_state: st.session_state.batch_results = {}
+if "portfolio_weights" not in st.session_state: st.session_state.portfolio_weights = {}
+if "portfolio_metrics" not in st.session_state: st.session_state.portfolio_metrics = {}
+# 当前分析的股票代码（用于检测切换）
+if "current_symbol" not in st.session_state: st.session_state.current_symbol = None
+
+# =========================================================
+#  侧边栏 (Sidebar)
+# =========================================================
+with st.sidebar:
+    st.title("🦄 VisionQuant Pro")
+    st.caption("AI 全栈量化投研系统 v8.8")
+    st.divider()
+
+    symbol_input = st.text_input("请输入 A 股代码", value="601899", help="输入6位代码")
+    symbol = symbol_input.strip().zfill(6)
+
+    mode = st.radio("功能模块:", ("🔍 实盘深度研判", "📊 批量组合分析", "🧪 策略模拟回测"))
+
+    if mode == "📊 批量组合分析":
+        st.divider()
+        st.subheader("批量分析参数")
+        batch_input = st.text_area(
+            "请输入股票代码（每行一个，最多30只）",
+            value="601899\n600519\n000001",
+            height=150,
+            help="每行一个6位股票代码"
+        )
+        max_positions = st.slider("最大持仓数量", 5, 15, 10)
+        min_weight = st.slider("最小仓位 (%)", 3, 10, 5) / 100
+        max_weight = st.slider("最大仓位 (%)", 15, 30, 20) / 100
+    
+    if mode == "🧪 策略模拟回测":
+        st.divider()
+        st.subheader("3. 回测参数")
+        bt_start = st.date_input("开始日期", datetime(2022, 1, 1))
+        bt_end = st.date_input("结束日期", datetime.now())
+        bt_cap = st.number_input("初始本金", 100000)
+        bt_ma = st.slider("趋势线周期 (MA)", 20, 120, 60)
+        bt_stop = st.slider("止损阈值 (%)", 3, 15, 8)
+        bt_vision = st.slider("AI 介入阈值 (Win%)", 50, 70, 57)
+
+    st.divider()
+    run_btn = st.button("🚀 立即开始分析", type="primary", use_container_width=True)
+
+    if st.button("🧹 清空对话历史"):
+        st.session_state.chat_history = []
+        st.session_state.last_voice_text = ""
+        st.rerun()
+    
+    # 添加返回按钮（当有URL参数时显示）
+    if "symbol" in st.query_params and "mode" in st.query_params:
+        if st.button("🔙 返回主界面", use_container_width=True):
+            st.query_params.clear()
+            if "res" in st.session_state:
+                del st.session_state.res
+            st.session_state.current_symbol = None
+            st.session_state.has_run = False
+            st.rerun()
+
+# =========================================================
+#  主界面逻辑
+# =========================================================
+
+# 检查URL参数（详情页跳转）
+query_params = st.query_params
+url_jump_mode = False
+if "symbol" in query_params and "mode" in query_params and query_params["mode"] == "detail":
+    url_symbol = query_params["symbol"].strip().zfill(6)
+    # 如果URL中的股票代码与侧边栏不同，使用URL中的
+    if url_symbol != symbol:
+        symbol = url_symbol
+        url_jump_mode = True
+        mode = "🔍 实盘深度研判"
+        # 清空旧结果
+        if "res" in st.session_state:
+            del st.session_state.res
+        st.session_state.current_symbol = symbol
+        st.session_state.has_run = True
+        run_btn = True
+    elif "res" not in st.session_state:
+        # 如果没有结果，触发分析
+        url_jump_mode = True
+        mode = "🔍 实盘深度研判"
+        st.session_state.has_run = True
+        run_btn = True
+    else:
+        # 已有结果，清除URL参数，恢复正常模式
+        st.query_params.clear()
+        url_jump_mode = False
+
+# 显示欢迎页面（仅在未运行且未点击按钮时）
+if not run_btn and not st.session_state.has_run:
+    st.header(f"👋 欢迎使用 VisionQuant Pro")
+    st.info(f"当前选中标的: **{symbol}**\n请在左侧侧边栏点击红色按钮启动。")
+    st.stop()
+
+# --- 模式 A: 实盘深度研判 ---
+if mode == "🔍 实盘深度研判":
+    # 检测股票切换：如果symbol变化，清空旧结果和状态
+    if st.session_state.current_symbol != symbol and st.session_state.current_symbol is not None:
+        if "res" in st.session_state:
+            del st.session_state.res
+        st.session_state.has_run = False  # 重置运行状态，允许重新分析
+        st.session_state.chat_history = []  # 清空聊天历史
+        st.session_state.last_voice_text = ""  # 重置语音锁
+    
+    if run_btn:
+        # 每次点击按钮都重新分析（即使股票代码相同，也允许重新分析）
+        st.session_state.has_run = True
+        st.session_state.chat_history = []  # 每次新分析清空旧聊天
+        st.session_state.last_voice_text = ""  # 重置语音锁
+        st.session_state.current_symbol = symbol  # 更新当前股票
+        
+        # 清空旧结果，强制重新生成
+        if "res" in st.session_state:
+            del st.session_state.res
+
+        with st.spinner(f"正在全栈扫描 {symbol} (视觉+财务+舆情)..."):
+            # 1. 数据
+            df = eng["loader"].get_stock_data(symbol)
+            if df.empty: st.error("数据获取失败"); st.stop()
+
+            fund_data = eng["fund"].get_stock_fundamentals(symbol)
+            stock_name = fund_data.get('name', symbol)
+
+            # 2. 视觉匹配（优化：传入价格序列用于相关性计算）
+            q_p = os.path.join(PROJECT_ROOT, "data", "temp_q.png")
+            mc = mpf.make_marketcolors(up='red', down='green', inherit=True)
+            s = mpf.make_mpf_style(marketcolors=mc, gridstyle='')
+            mpf.plot(df.tail(20), type='candle', style=s, savefig=dict(fname=q_p, dpi=50), figsize=(3, 3), axisoff=True)
+            
+            # 提取查询价格序列（最近20天收盘价，用于相关性计算）
+            query_prices = df.tail(20)['Close'].values if len(df) >= 20 else None
+            matches = eng["vision"].search_similar_patterns(q_p, top_k=10, query_prices=query_prices)
+
+
+            # 轨迹计算
+            def get_future_trajectories(matches, loader):
+                trajectories, details = [], []
+                for m in matches:
+                    try:
+                        hdf = loader.get_stock_data(m['symbol'])
+                        hdf.index = pd.to_datetime(hdf.index)
+                        target_date = pd.to_datetime(m['date'])
+                        if target_date in hdf.index:
+                            loc = hdf.index.get_loc(target_date)
+                            if loc + 5 < len(hdf):
+                                subset = hdf.iloc[loc: loc + 6]['Close'].values
+                                norm_path = (subset / subset[0] - 1) * 100
+                                trajectories.append(norm_path)
+                                details.append(f"{m['symbol']} ({m['date']})")
+                    except:
+                        continue
+                return trajectories, details
+
+
+            trajs, traj_labels = get_future_trajectories(matches, eng["loader"])
+
+            if trajs:
+                mean_path = np.mean(np.vstack(trajs), axis=0)
+                avg_ret = mean_path[-1]
+                win_rate = np.sum(np.vstack(trajs)[:, -1] > 0) / len(trajs) * 100
+            else:
+                mean_path, avg_ret, win_rate = np.zeros(6), 0.0, 50.0
+
+            # 3. 因子与新闻
+            df_f = eng["factor"]._add_technical_indicators(df)
+            news_text = eng["news"].get_latest_news(symbol)
+            ind_name, peers_df = eng["fund"].get_industry_peers(symbol)
+
+            # 4. 打分
+            total_score, initial_action, s_details = eng["factor"].get_scorecard(win_rate, df_f.iloc[-1], fund_data)
+
+            # 5. Agent
+            report = eng["agent"].analyze(symbol, total_score, initial_action,
+                                          {"win_rate": win_rate, "score": 0.9},
+                                          df_f.iloc[-1].to_dict(), fund_data, news_text)
+
+            # 6. 对比图
+            c_p = os.path.join(PROJECT_ROOT, "data", "comparison.png")
+            create_comparison_plot(q_p, matches, c_p)
+
+            # === 保存结果到 Session ===
+            st.session_state.res = {
+                "name": stock_name, "c_p": c_p, "trajs": trajs, "mean": mean_path,
+                "win": win_rate, "ret": avg_ret, "labels": traj_labels,
+                "score": total_score, "act": initial_action, "det": s_details,
+                "fund": fund_data, "df_f": df_f, "ind": ind_name, "peers": peers_df,
+                "news": news_text, "rep": report
+            }
+
+            # 构建上下文给 Chat 用
+            st.session_state.last_context = f"""
+            股票名称: {stock_name} ({symbol})
+            当前时间: {datetime.now().strftime('%Y-%m-%d')}
+            --- 量化数据 ---
+            AI评分: {total_score}/10
+            趋势信号: {initial_action}
+            形态胜率: {win_rate:.1f}%
+            --- 财务数据 ---
+            ROE: {fund_data.get('roe')}%
+            PE(TTM): {fund_data.get('pe_ttm')}
+            --- 舆情摘要 ---
+            {news_text[:500]}
+            --- 初始观点 ---
+            {report.reasoning}
+            """
+
+            # 注意：这里我们不再把初始报告塞进 chat_history，避免重复显示
+            
+            # 如果是从URL跳转来的，清除URL参数，恢复正常交互
+            if url_jump_mode:
+                # 延迟清除，确保结果已保存
+                st.session_state.clear_url_after_render = True
+
+    # === 渲染界面 ===
+    # 显示结果（如果有的话）
+    if "res" in st.session_state:
+        # 如果标记了需要清除URL，现在清除
+        if st.session_state.get("clear_url_after_render", False):
+            st.query_params.clear()
+            st.session_state.clear_url_after_render = False
+        
+        d = st.session_state.res
+
+        st.markdown(f"# 📊 深度投研报告: {d['name']} ({symbol})")
+
+        # 1. 视觉
+        st.subheader("1. 视觉模式识别")
+        st.image(d['c_p'], use_container_width=True)
+        if d['trajs']:
+            fig = go.Figure()
+            for i, p in enumerate(d['trajs']):
+                fig.add_trace(go.Scatter(y=p, mode='lines', line=dict(color='rgba(200,200,200,0.5)', width=1),
+                                         name=d['labels'][i]))
+            fig.add_trace(
+                go.Scatter(y=d['mean'], mode='lines+markers', line=dict(color='#d62728', width=3), name='平均预期'))
+            fig.update_layout(title=f"未来5日走势推演 (胜率: {d['win']:.0f}%)", xaxis_title="天数", yaxis_title="收益%",
+                              height=400)
+            st.plotly_chart(fig, config={"displayModeBar": False}, use_container_width=True)
+            c1, c2 = st.columns(2)
+            c1.metric("历史胜率", f"{d['win']:.1f}%")
+            c2.metric("预期收益", f"{d['ret']:.2f}%", delta_color="normal")
+
+        # 2. 量化
+        st.divider()
+        c_left, c_right = st.columns([1.5, 1])
+        with c_left:
+            st.subheader("2. 量化多因子看板")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("AI 总评分", f"{d['score']}/10", delta=d['act'])
+            m2.metric("ROE", f"{d['fund'].get('roe')}%")
+            m3.metric("PE", f"{d['fund'].get('pe_ttm')}")
+            m4.metric("趋势", "看涨" if d['df_f'].iloc[-1]['MA_Signal'] > 0 else "看跌")
+
+            with st.expander("📊 杜邦分析 & 因子明细"):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.write("**杜邦拆解**")
+                    st.write(f"净利率: {d['fund'].get('net_profit_margin')}%")
+                    st.write(f"周转率: {d['fund'].get('asset_turnover')}")
+                    st.write(f"权益乘数: {d['fund'].get('leverage')}x")
+                with col_b:
+                    st.write("**技术因子**")
+                    st.json(d['det'])
+
+        with c_right:
+            st.subheader(f"3. 行业对标 ({d['ind']})")
+            st.dataframe(d['peers'], hide_index=True)
+
+        # 3. 新闻
+        st.divider()
+        st.subheader("4. 新闻舆情")
+        st.info(d['news'])
+
+        # 4. Agent 决策书 (这里只显示一次，静态的)
+        st.divider()
+        st.subheader("5. AI 基金经理终审")
+        color = "green" if d['rep'].action == "BUY" else "red" if d['rep'].action == "SELL" else "orange"
+        st.markdown(f"""
+        <div class="agent-box">
+            <h2 style="color:{color}; margin:0">{d['rep'].action}</h2>
+            <p>信心: {d['rep'].confidence}% | 风险: {d['rep'].risk_level}</p>
+            <hr><p>{d['rep'].reasoning}</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # PDF 导出
+        pdf_p = os.path.join(PROJECT_ROOT, "data", f"Report_{symbol}.pdf")
+        if st.button("📄 导出 PDF"):
+            generate_report_pdf(f"{d['name']}({symbol})", d['rep'], d['c_p'], pdf_p)
+            with open(pdf_p, "rb") as f:
+                st.download_button("下载 PDF", f, file_name=f"VQ_{symbol}.pdf")
+
+        # === 6. 交互问答 (Interactive Chat) ===
+        st.divider()
+        st.subheader("💬 智能对话")
+
+        # 显示历史
+        for msg in st.session_state.chat_history:
+            with st.chat_message(msg["role"]): st.markdown(msg["content"])
+
+        c_mic, c_input = st.columns([1, 8])
+        user_voice_text = None
+
+        with c_mic:
+            st.write(" ")
+            # 录音组件
+            audio = mic_recorder(start_prompt="🎙️", stop_prompt="⏹️", key='recorder', format='wav')
+
+        if audio:
+            # === 防复读核心：对比 audio 字节流的哈希或简单判断是否刚处理过 ===
+            # 这里简化逻辑：直接调用识别，但利用 session_state 锁住不让它重复上屏
+
+            # 调用识别
+            transcribed = eng["audio"].transcribe(audio['bytes'])
+            if transcribed:
+                # 只有当识别出的文字和上一次不一样，或者确实是新录音时才处理
+                # 最简单的防复读：检查是否与 session_state.last_voice_text 相同
+                if transcribed != st.session_state.last_voice_text:
+                    user_voice_text = transcribed
+                    st.session_state.last_voice_text = transcribed  # 更新锁
+            else:
+                # 识别失败不弹窗干扰
+                pass
+
+        with c_input:
+            text_input = st.chat_input("输入问题...")
+
+        # 统一提交逻辑
+        final_input = user_voice_text if user_voice_text else text_input
+
+        if final_input:
+            # 用户上屏
+            st.session_state.chat_history.append({"role": "user", "content": final_input})
+
+            # 强制刷新以立刻显示用户问题
+            st.rerun()
+
+        # 处理 AI 回复 (在 rerun 后执行，此时 chat_history 最后一类是 user)
+        if st.session_state.chat_history and st.session_state.chat_history[-1]["role"] == "user":
+            user_q = st.session_state.chat_history[-1]["content"]
+            with st.chat_message("assistant"):
+                with st.spinner("思考中..."):
+                    resp = eng["agent"].chat(user_q, st.session_state.last_context)
+                    st.markdown(resp)
+                    st.session_state.chat_history.append({"role": "assistant", "content": resp})
+
+# --- 模式 B: 回测 ---
+elif mode == "🧪 策略模拟回测":
+    st.subheader(f"🧪 策略模拟回测: {symbol}")
+    # 检测股票切换
+    if st.session_state.current_symbol != symbol and st.session_state.current_symbol is not None:
+        st.session_state.has_run = False
+    
+    if run_btn:
+        st.session_state.has_run = True
+        st.session_state.current_symbol = symbol
+        with st.spinner("回测中..."):
+            df_bt = eng["loader"].get_stock_data(symbol, start_date=bt_start.strftime("%Y%m%d"))
+            if not df_bt.empty:
+                df_bt.index = pd.to_datetime(df_bt.index)
+                mask = (df_bt.index >= pd.to_datetime(bt_start)) & (df_bt.index <= pd.to_datetime(bt_end))
+                df_bt = df_bt.loc[mask].copy()
+                if len(df_bt) > 50:
+                    # 计算技术指标
+                    df_bt['MA20'] = df_bt['Close'].rolling(window=20).mean()
+                    df_bt['MA60'] = df_bt['Close'].rolling(window=bt_ma).mean()
+                    # 计算MACD
+                    exp12 = df_bt['Close'].ewm(span=12, adjust=False).mean()
+                    exp26 = df_bt['Close'].ewm(span=26, adjust=False).mean()
+                    df_bt['MACD'] = (exp12 - exp26) * 2
+                    df_bt = df_bt.dropna()
+                    
+                    # 加载AI胜率数据
+                    pred_path = os.path.join(PROJECT_ROOT, "data", "indices", "prediction_cache.csv")
+                    vision_map = {}
+                    has_vision_data = False
+                    if os.path.exists(pred_path):
+                        try:
+                            pdf = pd.read_csv(pred_path)
+                            pdf['date'] = pdf['date'].astype(str).str.replace('-', '')
+                            pdf['symbol'] = pdf['symbol'].astype(str).str.zfill(6)
+                            vision_map = pdf.set_index(['symbol', 'date'])['pred_win_rate'].to_dict()
+                            has_vision_data = len(vision_map) > 0
+                        except:
+                            pass
+                    
+                    # 初始化
+                    cash, shares, equity = bt_cap, 0, []
+                    trade_log = []
+                    entry_price = 0.0
+                    
+                    # 逐日交易
+                    for _, row in df_bt.iterrows():
+                        p = row['Close']
+                        ma20 = row.get('MA20', p)
+                        ma60 = row.get('MA60', p)
+                        macd = row.get('MACD', 0)
+                        date_str = row.name.strftime("%Y%m%d")
+                        
+                        # 获取AI胜率
+                        ai_win = vision_map.get((symbol, date_str), 50.0)
+                        
+                        # === VQ策略核心逻辑 ===
+                        target_pos = 0.0
+                        
+                        # 牛市模式（价格 > MA60）
+                        if p > ma60:
+                            # 强趋势锁仓
+                            if macd > 0 or p > ma20:
+                                target_pos = 1.0  # 100%仓位
+                            # 回调判断
+                            elif ai_win >= bt_vision:
+                                target_pos = 0.81  # 81%仓位
+                            else:
+                                target_pos = 0.0  # 破位离场
+                        
+                        # 熊市模式（价格 < MA60）
+                        else:
+                            # 视觉狙击
+                            if ai_win >= bt_vision + 2:
+                                target_pos = 0.50  # 50%仓位
+                            else:
+                                target_pos = 0.03  # 3%避险
+                        
+                        # === 执行交易 ===
+                        total_assets = cash + shares * p
+                        target_val = total_assets * target_pos
+                        target_shares = int(target_val / p) if p > 0 else 0
+                        diff = target_shares - shares
+                        
+                        # 过滤微小调仓（10%）
+                        if abs(diff * p) > total_assets * 0.1:
+                            if diff > 0:  # 买入
+                                cost = diff * p * 1.0003
+                                if cash >= cost:
+                                    cash -= cost
+                                    shares += diff
+                                    if entry_price == 0:
+                                        entry_price = p
+                                    trade_log.append({'date': date_str, 'action': 'BUY', 'price': p})
+                            
+                            elif diff < 0:  # 卖出
+                                # 止损检查
+                                pnl = (p - entry_price) / entry_price if entry_price > 0 and shares > 0 else 0
+                                if pnl < -bt_stop / 100:
+                                    diff = -shares  # 止损强制清仓
+                                
+                                revenue = abs(diff) * p * 0.9997
+                                cash += revenue
+                                shares += diff
+                                if shares == 0:
+                                    entry_price = 0
+                                trade_log.append({'date': date_str, 'action': 'SELL', 'price': p})
+                        
+                        equity.append(cash + shares * p)
+                    
+                    # 绘制结果
+                    fig = go.Figure()
+                    fig.add_trace(
+                        go.Scatter(x=df_bt.index, y=equity, name="VQ 策略", 
+                                 line=dict(color='#ff4b4b', width=2)))
+                    bench = (df_bt['Close'] / df_bt['Close'].iloc[0]) * bt_cap
+                    fig.add_trace(go.Scatter(x=df_bt.index, y=bench, name="基准（买入持有）", 
+                                           line=dict(color='gray', dash='dash')))
+                    fig.update_layout(title="策略收益曲线", height=400)
+                    st.plotly_chart(fig, config={"displayModeBar": False}, use_container_width=True)
+                    
+                    # 计算指标
+                    ret = (equity[-1] - bt_cap) / bt_cap * 100
+                    bench_ret = (df_bt['Close'].iloc[-1] - df_bt['Close'].iloc[0]) / df_bt['Close'].iloc[0] * 100
+                    alpha = ret - bench_ret
+                    
+                    # 显示结果
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("策略收益率", f"{ret:.2f}%")
+                    col2.metric("Alpha", f"{alpha:.2f}%", delta=f"{alpha:.2f}%")
+                    col3.metric("交易次数", len(trade_log))
+                    col4.metric("数据来源", "有AI数据" if has_vision_data else "无AI数据")
+                    
+                    # 显示交易记录示例
+                    with st.expander("📋 查看交易记录（前10笔）"):
+                        if trade_log:
+                            trade_df = pd.DataFrame(trade_log[:10])
+                            st.dataframe(trade_df, use_container_width=True)
+                        else:
+                            st.info("本次回测期间无交易发生（可能因为：1.无AI数据 2.阈值设置过高 3.股票始终不满足交易条件）")
+                else:
+                    st.error("数据不足")
+            else:
+                st.error("数据失败")
+    else:
+        st.info("👈 请在左侧点击启动")
+
+# --- 模式 C: 批量组合分析 ---
+elif mode == "📊 批量组合分析":
+    if run_btn:
+        # 解析股票代码
+        symbols = [s.strip().zfill(6) for s in batch_input.split('\n') if s.strip()][:30]
+        
+        if len(symbols) == 0:
+            st.error("❌ 请输入至少一只股票代码")
+            st.stop()
+        
+        st.session_state.has_run = True
+        # 清空旧结果
+        if "batch_results" in st.session_state:
+            del st.session_state.batch_results
+        if "multi_tier_result" in st.session_state:
+            del st.session_state.multi_tier_result
+        if "portfolio_metrics" in st.session_state:
+            del st.session_state.portfolio_metrics
+        
+        # 初始化批量分析器
+        batch_analyzer = BatchAnalyzer(eng)
+        portfolio_optimizer = PortfolioOptimizer()
+        
+        # 进度条
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        def update_progress(current, total, symbol):
+            progress = current / total
+            progress_bar.progress(progress)
+            status_text.text(f"正在分析 {symbol} ({current}/{total})...")
+        
+        # 批量分析
+        with st.spinner("正在批量分析..."):
+            results = batch_analyzer.analyze_batch(symbols, update_progress)
+        
+        # 组合优化 - 使用新的多层优化
+        with st.spinner("正在优化组合配置..."):
+            multi_tier_result = portfolio_optimizer.optimize_multi_tier_portfolio(
+                results, eng["loader"], 
+                min_weight=min_weight, max_weight=max_weight,
+                max_positions=max_positions
+            )
+            
+            # 合并所有权重用于计算总体指标
+            all_weights = {}
+            all_weights.update(multi_tier_result['core'])
+            all_weights.update(multi_tier_result['enhanced'])
+            
+            portfolio_metrics = portfolio_optimizer.calculate_portfolio_metrics(
+                all_weights, results, eng["loader"]
+            ) if all_weights else {}
+        
+        # 保存结果
+        st.session_state.batch_results = results
+        st.session_state.multi_tier_result = multi_tier_result
+        st.session_state.portfolio_metrics = portfolio_metrics
+        
+        progress_bar.empty()
+        status_text.empty()
+        st.success(f"✅ 批量分析完成！共分析 {len(symbols)} 只股票")
+    
+    # 显示结果
+    if st.session_state.batch_results:
+        results = st.session_state.batch_results
+        multi_tier = st.session_state.multi_tier_result
+        portfolio_metrics = st.session_state.portfolio_metrics
+        
+        # 提取多层结果
+        core_weights = multi_tier.get('core', {})
+        enhanced_weights = multi_tier.get('enhanced', {})
+        tier_info = multi_tier.get('tier_info', {})
+        
+        all_weights = {}
+        all_weights.update(core_weights)
+        all_weights.update(enhanced_weights)
+        
+        st.markdown("# 📊 批量组合分析报告")
+        
+        # 筛选股票
+        buy_stocks = {k: v for k, v in results.items() 
+                      if v.get('action') == 'BUY' and v.get('score', 0) >= 7}
+        enhanced_stocks = {k: v for k, v in results.items() 
+                          if v.get('score', 0) >= 6 and v.get('action') != 'SELL' and k not in buy_stocks}
+        wait_stocks = {k: v for k, v in results.items() 
+                      if v.get('action') == 'WAIT' and v.get('score', 0) < 6}
+        sell_stocks = {k: v for k, v in results.items() 
+                      if v.get('action') == 'SELL' or v.get('score', 0) < 5}
+        
+        # 策略说明
+        strategy_emojis = {
+            'core_only': '🎯',
+            'mixed': '⚖️',
+            'enhanced_only': '⚠️'
+        }
+        strategy = tier_info.get('strategy', 'unknown')
+        st.info(f"{strategy_emojis.get(strategy, '📊')} **配置策略：** {tier_info.get('description', '')}")
+        
+        # 组合指标 - 始终显示
+        st.subheader("📊 组合配置指标")
+        if all_weights and portfolio_metrics:
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("组合预期收益", f"{portfolio_metrics.get('expected_return', 0):.2f}%")
+            col2.metric("组合风险", f"{portfolio_metrics.get('risk', 0):.2f}%")
+            col3.metric("夏普比率", f"{portfolio_metrics.get('sharpe_ratio', 0):.2f}")
+            col4.metric("总持仓数", f"{len(all_weights)}只")
+            
+            # 分层统计
+            col1, col2, col3 = st.columns(3)
+            col1.metric("核心推荐", f"{tier_info.get('core_count', 0)}只", 
+                       help="评分≥7且action=BUY")
+            col2.metric("备选增强", f"{tier_info.get('enhanced_count', 0)}只", 
+                       help="评分≥6且action≠SELL")
+            col3.metric("观察监控", f"{len(wait_stocks) + len(sell_stocks)}只",
+                       help="评分<6或action=SELL")
+        else:
+            st.warning("⚠️ 暂无符合条件的股票，无法生成组合配置。建议调整参数或等待更好的市场机会。")
+        
+        st.divider()
+        
+        # 仓位分配 - 分层展示
+        if all_weights and len(all_weights) > 0:
+            st.subheader("💰 组合仓位分配")
+            
+            # 双饼图：核心 vs 增强
+            if core_weights and enhanced_weights:
+                col_pie1, col_pie2 = st.columns(2)
+                
+                with col_pie1:
+                    core_total = sum(core_weights.values())
+                    fig_core = go.Figure(data=[go.Pie(
+                        labels=[f"{results[s].get('name', s)[:4]}" for s in core_weights.keys()],
+                        values=[w/core_total*100 for w in core_weights.values()],
+                        hole=0.4,
+                        marker=dict(colors=['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8'])
+                    )])
+                    fig_core.update_layout(
+                        title=f"核心推荐 (70%仓位)", 
+                        height=350,
+                        showlegend=True
+                    )
+                    st.plotly_chart(fig_core, config={"displayModeBar": False}, use_container_width=True)
+                
+                with col_pie2:
+                    enhanced_total = sum(enhanced_weights.values())
+                    fig_enhanced = go.Figure(data=[go.Pie(
+                        labels=[f"{results[s].get('name', s)[:4]}" for s in enhanced_weights.keys()],
+                        values=[w/enhanced_total*100 for w in enhanced_weights.values()],
+                        hole=0.4,
+                        marker=dict(colors=['#C7CEEA', '#B5EAD7', '#FFB6B9', '#FFDAB9', '#E0BBE4'])
+                    )])
+                    fig_enhanced.update_layout(
+                        title=f"备选增强 (30%仓位)", 
+                        height=350,
+                        showlegend=True
+                    )
+                    st.plotly_chart(fig_enhanced, config={"displayModeBar": False}, use_container_width=True)
+            
+            else:
+                # 单饼图
+                col_chart, col_list = st.columns([2, 1])
+                
+                with col_chart:
+                    fig_pie = go.Figure(data=[go.Pie(
+                        labels=[f"{results[s].get('name', s)} ({s})" for s in all_weights.keys()],
+                        values=[w*100 for w in all_weights.values()],
+                        hole=0.4,
+                        textinfo='label+percent',
+                        textposition='outside'
+                    )])
+                    fig_pie.update_layout(title="仓位分配", height=400)
+                    st.plotly_chart(fig_pie, config={"displayModeBar": False}, use_container_width=True)
+                
+                with col_list:
+                    st.write("**详细仓位**")
+                    for symbol, weight in sorted(all_weights.items(), 
+                                               key=lambda x: x[1], reverse=True):
+                        data = results.get(symbol, {})
+                        tier_tag = "🎯核心" if symbol in core_weights else "⚡增强"
+                        st.write(f"{tier_tag} **{data.get('name', symbol)}** ({symbol})")
+                        st.write(f"仓位: {weight*100:.1f}% | 评分: {data.get('score', 0):.1f}/10")
+                        st.write("---")
+            
+            st.divider()
+        
+        # 核心推荐组合详情
+        if buy_stocks:
+            st.subheader(f"🎯 核心推荐组合 ({len(buy_stocks)}只)")
+            
+            # 按评分排序
+            sorted_buy = sorted(buy_stocks.items(), 
+                              key=lambda x: x[1].get('score', 0), reverse=True)
+            
+            # 创建表格展示（使用Streamlit原生表格）
+            for idx, (symbol, data) in enumerate(sorted_buy):
+                weight = core_weights.get(symbol, 0)
+                col1, col2, col3, col4, col5, col6, col7 = st.columns([3, 1, 1, 1, 1, 1, 1])
+                
+                with col1:
+                    # 使用按钮作为超链接
+                    if st.button(f"📊 {data.get('name', symbol)} ({symbol})", 
+                               key=f"link_{symbol}", use_container_width=True):
+                        # 清空当前结果，准备显示新股票
+                        if "res" in st.session_state:
+                            del st.session_state.res
+                        st.session_state.current_symbol = None
+                        st.session_state.has_run = False
+                        st.query_params.update({"symbol": symbol, "mode": "detail"})
+                        st.rerun()
+                
+                with col2:
+                    st.metric("评分", f"{data.get('score', 0):.1f}", label_visibility="collapsed")
+                with col3:
+                    st.metric("胜率", f"{data.get('win_rate', 0):.1f}%", label_visibility="collapsed")
+                with col4:
+                    st.metric("预期", f"{data.get('expected_return', 0):.2f}%", label_visibility="collapsed")
+                with col5:
+                    st.metric("仓位", f"{weight*100:.1f}%" if weight > 0 else "-", label_visibility="collapsed")
+                with col6:
+                    st.metric("ROE", f"{data.get('roe', 0):.1f}%", label_visibility="collapsed")
+                with col7:
+                    st.write(f"**🎯 {data.get('action', 'BUY')}**")
+                
+                if idx < len(sorted_buy) - 1:
+                    st.divider()
+        
+        # 备选增强组合（评分≥6且非SELL）
+        if enhanced_stocks:
+            st.subheader(f"⚡ 备选增强组合 ({len(enhanced_stocks)}只)")
+            st.caption("评分≥6，可作为辅助配置，建议谨慎操作")
+            
+            sorted_enhanced = sorted(enhanced_stocks.items(), 
+                                   key=lambda x: x[1].get('score', 0), reverse=True)
+            
+            for idx, (symbol, data) in enumerate(sorted_enhanced[:10]):  # 最多展示10只
+                weight = enhanced_weights.get(symbol, 0)
+                col1, col2, col3, col4, col5 = st.columns([3, 1, 1, 1, 2])
+                
+                with col1:
+                    if st.button(f"📊 {data.get('name', symbol)} ({symbol})", 
+                               key=f"link_enh_{symbol}", use_container_width=True):
+                        if "res" in st.session_state:
+                            del st.session_state.res
+                        st.session_state.current_symbol = None
+                        st.session_state.has_run = False
+                        st.query_params.update({"symbol": symbol, "mode": "detail"})
+                        st.rerun()
+                
+                with col2:
+                    st.metric("评分", f"{data.get('score', 0):.1f}", label_visibility="collapsed")
+                with col3:
+                    st.metric("胜率", f"{data.get('win_rate', 0):.1f}%", label_visibility="collapsed")
+                with col4:
+                    st.metric("仓位", f"{weight*100:.1f}%" if weight > 0 else "-", label_visibility="collapsed")
+                with col5:
+                    st.write(f"**⚡ {data.get('action', 'WAIT')}**")
+                
+                if idx < len(sorted_enhanced[:10]) - 1:
+                    st.divider()
+        
+        # K线图网格预览（整合核心+增强）
+        if buy_stocks or enhanced_stocks:
+            st.subheader("📊 股票K线图预览")
+            display_stocks = list(buy_stocks.items())[:6] + list(enhanced_stocks.items())[:3]
+            
+            cols = st.columns(3)
+            for idx, (symbol, data) in enumerate(display_stocks[:9]):
+                with cols[idx % 3]:
+                    try:
+                        df = eng["loader"].get_stock_data(symbol)
+                        if not df.empty:
+                            tier_tag = "🎯核心" if symbol in buy_stocks else "⚡增强"
+                            fig_mini = go.Figure()
+                            fig_mini.add_trace(go.Candlestick(
+                                x=df.tail(20).index,
+                                open=df.tail(20)['Open'],
+                                high=df.tail(20)['High'],
+                                low=df.tail(20)['Low'],
+                                close=df.tail(20)['Close']
+                            ))
+                            fig_mini.update_layout(
+                                title=f"{tier_tag} {data.get('name', symbol)} ({symbol})",
+                                height=200,
+                                xaxis_rangeslider_visible=False,
+                                margin=dict(l=0, r=0, t=30, b=0)
+                            )
+                            st.plotly_chart(fig_mini, config={"displayModeBar": False}, use_container_width=True)
+                    except:
+                        st.write(f"{data.get('name', symbol)} - 数据加载失败")
+        
+        # 观望/卖出列表
+        if wait_stocks or sell_stocks:
+            st.divider()
+            st.subheader("⚠️ 观望/卖出列表")
+            
+            all_other = {**wait_stocks, **sell_stocks}
+            if all_other:
+                for symbol, data in sorted(all_other.items(), 
+                                         key=lambda x: x[1].get('score', 0)):
+                    col1, col2, col3 = st.columns([3, 1, 4])
+                    with col1:
+                        if st.button(f"📊 {data.get('name', symbol)} ({symbol})", 
+                                   key=f"link_other_{symbol}", use_container_width=True):
+                            # 清空当前结果，准备显示新股票
+                            if "res" in st.session_state:
+                                del st.session_state.res
+                            st.session_state.current_symbol = None
+                            st.session_state.has_run = False
+                            st.query_params.update({"symbol": symbol, "mode": "detail"})
+                            st.rerun()
+                    with col2:
+                        st.write(f"**{data.get('score', 0):.1f}/10**")
+                    with col3:
+                        st.write(f"{data.get('action', 'WAIT')} - {data.get('reasoning', '')[:50]}")
+                    st.divider()
+    
+    else:
+        st.info("👈 请在左侧输入股票代码并点击启动")
