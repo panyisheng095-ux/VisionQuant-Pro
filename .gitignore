@@ -36,8 +36,9 @@ env/
 .ipynb_checkpoints
 
 # Data files (整个data目录不上传，太大了)
-data/
-!data/.gitkeep
+# 使用/data/确保只匹配根目录的data，不影响src/data
+/data/
+!/data/.gitkeep
 
 # Model files
 models/*.h5

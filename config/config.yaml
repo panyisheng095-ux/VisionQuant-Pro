@@ -1,0 +1,91 @@
+# ===========================================
+# VisionQuant-Pro 配置文件
+# ===========================================
+
+# 项目信息
+project:
+  name: "VisionQuant-Pro"
+  version: "1.0.0"
+  description: "让AI学会看K线图 | AI-Powered Visual Quantitative Trading"
+
+# 数据配置
+data:
+  # 数据目录
+  raw_dir: "data/raw"
+  images_dir: "data/images"
+  indices_dir: "data/indices"
+  processed_dir: "data/processed"
+  
+  # K线图参数
+  chart:
+    lookback_days: 60        # 每张K线图包含的天数
+    image_size: [224, 224]   # 图像尺寸
+    style: "binance"         # K线图样式: binance, yahoo, charles
+
+# 模型配置
+model:
+  # CAE自编码器
+  cae:
+    latent_dim: 1024         # 隐空间维度
+    input_channels: 3        # 输入通道数 (RGB)
+    encoder_filters: [32, 64, 128, 256]  # 编码器卷积层
+    
+  # FAISS索引
+  faiss:
+    index_type: "IVF"        # 索引类型: Flat, IVF, HNSW
+    nlist: 100               # IVF聚类数
+    nprobe: 10               # 搜索时探测的聚类数
+
+# 策略配置
+strategy:
+  # 视觉相似度
+  vision:
+    top_k: 10                # 返回最相似的K个形态
+    correlation_weight: 0.7  # 价格相关性权重
+    vector_weight: 0.3       # 向量相似度权重
+    min_correlation: 0.5     # 最小相关性阈值
+    time_isolation_days: 60  # 时间隔离（防止过拟合）
+  
+  # 评分系统
+  scoring:
+    visual_weight: 3         # 视觉分满分
+    fundamental_weight: 4    # 财务分满分
+    quant_weight: 3          # 量化分满分
+    buy_threshold: 7         # 买入阈值
+    sell_threshold: 5        # 卖出阈值
+  
+  # 组合优化
+  portfolio:
+    min_weight: 0.05         # 最小仓位
+    max_weight: 0.20         # 最大仓位
+    max_positions: 10        # 最大持仓数
+    risk_free_rate: 0.02     # 无风险利率
+
+# Web配置
+web:
+  port: 8501
+  theme: "light"
+  page_icon: "🦄"
+
+# AI Agent配置
+agent:
+  # 使用的LLM
+  llm:
+    provider: "google"       # google, openai, anthropic
+    model: "gemini-2.5-pro-preview-06-05"
+    temperature: 0.3
+    max_tokens: 2000
+  
+  # 音频识别
+  audio:
+    enabled: true
+    models:
+      - "gemini-2.0-flash-exp"
+      - "gemini-1.5-pro"
+      - "gemini-1.5-flash"
+
+# 日志配置
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/visionquant.log"

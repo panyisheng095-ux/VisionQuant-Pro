@@ -61,26 +61,37 @@ VisionQuant-Pro 是一个创新的量化投资系统，将**计算机视觉**与
 
 ```
 VisionQuant-Pro/
-├── src/
-│   ├── models/
-│   │   ├── cae_model.py          # 卷积自编码器
-│   │   ├── vision_engine.py      # 视觉识别引擎
-│   │   └── predict_engine.py     # 预测引擎
-│   ├── strategies/
-│   │   ├── backtester.py         # VQ策略回测
-│   │   ├── batch_analyzer.py     # 批量分析器
-│   │   └── portfolio_optimizer.py # 组合优化器
-│   ├── factors/
-│   │   └── factor_miner.py       # 多因子挖掘
-│   └── utils/
-│       └── data_loader.py        # 数据加载器
+├── src/                           # 源码目录
+│   ├── models/                    # 深度学习模型
+│   │   ├── autoencoder.py         # CAE卷积自编码器
+│   │   ├── vision_engine.py       # 视觉识别引擎
+│   │   ├── predict_engine.py      # 预测引擎
+│   │   └── train_cae.py           # 模型训练脚本
+│   ├── strategies/                # 交易策略
+│   │   ├── backtester.py          # VQ策略回测
+│   │   ├── batch_analyzer.py      # 批量分析器
+│   │   ├── portfolio_optimizer.py # 马科维茨组合优化
+│   │   ├── factor_mining.py       # 多因子挖掘
+│   │   └── fundamental.py         # 基本面分析
+│   ├── data/                      # 数据处理
+│   │   ├── data_loader.py         # 数据加载器
+│   │   └── news_harvester.py      # 新闻采集
+│   ├── utils/                     # 工具函数
+│   │   ├── audio_manager.py       # 语音识别
+│   │   ├── pdf_generator.py       # 报告生成
+│   │   └── visualizer.py          # 可视化
+│   └── agent/                     # AI Agent
+│       └── quant_agent.py         # LLM投资顾问
 ├── web/
-│   └── app.py                    # Streamlit Web界面
-├── data/
-│   ├── raw/                      # 原始数据
-│   └── indices/                  # 索引文件
-└── configs/
-    └── config.yaml               # 配置文件
+│   └── app.py                     # Streamlit Web界面
+├── config/
+│   └── config.yaml                # 配置文件
+├── data/                          # 数据目录（需自行准备）
+├── scripts/
+│   └── prepare_data.py            # 数据准备脚本
+├── run.py                         # 一键启动脚本 ⭐
+├── requirements.txt               # 依赖清单
+└── README.md
 ```
 
 ### 📚 项目文档
@@ -120,19 +131,35 @@ VisionQuant-Pro/
 
 ### 🚀 快速开始
 
-#### 1. 环境要求
+#### 1. 克隆仓库
 ```bash
-Python 3.9+
-pip install -r requirements.txt
-```
-
-#### 2. 安装依赖
-```bash
+git clone https://github.com/panyisheng095-ux/VisionQuant-Pro.git
 cd VisionQuant-Pro
+```
+
+#### 2. 创建虚拟环境（推荐）
+```bash
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+# 或 venv\Scripts\activate  # Windows
+```
+
+#### 3. 安装依赖
+```bash
 pip install -r requirements.txt
 ```
 
-#### 3. 准备数据
+**常见问题解决：**
+- 如果缺少 `streamlit_mic_recorder`，运行：`pip install streamlit-mic-recorder`
+- 如果 `faiss-cpu` 安装失败，尝试：`pip install faiss-cpu==1.7.4`
+
+#### 4. 配置API Key（可选，用于AI对话）
+```bash
+# 创建 .env 文件
+echo "GOOGLE_API_KEY=your_api_key_here" > .env
+```
+
+#### 5. 准备数据
 ```bash
 # 自动下载示例数据并创建目录结构
 python scripts/prepare_data.py
@@ -140,23 +167,35 @@ python scripts/prepare_data.py
 
 **注意：** 完整数据集（154GB）不包含在仓库中，需要自行训练生成。示例数据仅包含5只股票用于快速体验。
 
-#### 4. 启动Web界面
+#### 6. 启动Web界面（推荐方式）
 ```bash
-streamlit run web/app.py
+# 方式一：使用启动脚本（自动解决Python路径问题）⭐ 推荐
+python run.py
+
+# 方式二：直接运行Streamlit
+cd VisionQuant-Pro  # 确保在项目根目录
+PYTHONPATH=. streamlit run web/app.py
 ```
 
 访问：http://localhost:8501
 
+#### 🐛 遇到问题？
+
+如果出现 `ModuleNotFoundError: No module named 'src.data'`，请使用 `python run.py` 启动！
+
 ### 📦 依赖项
 
 主要依赖包：
-- `streamlit` - Web应用框架
-- `tensorflow/keras` - 深度学习框架
-- `faiss-cpu` - 向量检索
+- `streamlit` + `streamlit-mic-recorder` - Web应用框架+语音输入
+- `torch` + `torchvision` - PyTorch深度学习框架
+- `faiss-cpu` - 向量检索（毫秒级）
 - `akshare` - A股数据获取
-- `langchain` - AI对话框架
-- `plotly` - 可视化
-- `scipy` - 科学计算（组合优化）
+- `langchain` + `langchain-google-genai` - AI对话框架
+- `plotly` + `mplfinance` - 可视化
+- `scipy` - 科学计算（马科维茨优化）
+- `google-generativeai` - Gemini语音识别
+
+完整依赖见 [requirements.txt](requirements.txt)
 
 ### 💡 使用示例
 
@@ -310,14 +349,27 @@ VisionQuant-Pro is an innovative quantitative trading system that deeply integra
 git clone https://github.com/panyisheng095-ux/VisionQuant-Pro.git
 cd VisionQuant-Pro
 
+# Create virtual environment (recommended)
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+
 # Install dependencies
 pip install -r requirements.txt
 
-# Launch Web interface
-streamlit run web/app.py
+# Prepare sample data
+python scripts/prepare_data.py
+
+# Launch Web interface (recommended)
+python run.py  # Automatically handles Python path issues
+
+# Alternative: direct Streamlit launch
+# PYTHONPATH=. streamlit run web/app.py
 ```
 
 Visit: http://localhost:8501
+
+**Troubleshooting:**
+- If `ModuleNotFoundError: No module named 'src.data'`, use `python run.py` instead of direct streamlit command
 
 ### 📊 Performance
 
