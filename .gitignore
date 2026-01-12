@@ -76,3 +76,11 @@ htmlcov/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Paper/Thesis (私人论文资料，不公开)
+/paper/
+docs/论文修改综合方案.md
+docs/行为金融学论述模板.md
+
+# Debug files
+debug_audio_*.wav
