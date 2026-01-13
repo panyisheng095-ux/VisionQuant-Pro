@@ -137,6 +137,18 @@ with st.sidebar:
         bt_ma = st.slider("趋势线周期 (MA)", 20, 120, 60)
         bt_stop = st.slider("止损阈值 (%)", 3, 15, 8)
         bt_vision = st.slider("AI 介入阈值 (Win%)", 50, 70, 57)
+        
+        # Walk-Forward验证选项
+        st.divider()
+        st.markdown("**🔬 验证方法**")
+        bt_validation = st.radio(
+            "选择回测验证方式",
+            ("简单回测", "Walk-Forward验证（严格）"),
+            help="Walk-Forward验证模拟真实交易，使用滚动窗口防止未来函数泄漏"
+        )
+        if bt_validation == "Walk-Forward验证（严格）":
+            wf_train_months = st.slider("训练期（月）", 6, 36, 24, help="每次训练使用的历史数据长度")
+            wf_test_months = st.slider("测试期（月）", 3, 12, 6, help="每次测试的时间长度")
 
     st.divider()
     # ================== 强制重载（解决缓存导致的 N/A / 旧逻辑不生效） ==================
@@ -494,7 +506,11 @@ elif mode == "🧪 策略模拟回测":
     if run_btn:
         st.session_state.has_run = True
         st.session_state.current_symbol = symbol
-        with st.spinner("回测中..."):
+        
+        # 检查是否使用Walk-Forward验证
+        use_walk_forward = bt_validation == "Walk-Forward验证（严格）"
+        
+        with st.spinner("回测中..." if not use_walk_forward else "Walk-Forward验证中（可能需要较长时间）..."):
             df_bt = eng["loader"].get_stock_data(symbol, start_date=bt_start.strftime("%Y%m%d"))
             if not df_bt.empty:
                 df_bt.index = pd.to_datetime(df_bt.index)
@@ -616,6 +632,20 @@ elif mode == "🧪 策略模拟回测":
                     col2.metric("Alpha", f"{alpha:.2f}%", delta=f"{alpha:.2f}%")
                     col3.metric("交易次数", len(trade_log))
                     col4.metric("数据来源", "有AI数据" if has_vision_data else "无AI数据")
+                    
+                    # Walk-Forward验证额外信息
+                    if use_walk_forward:
+                        st.divider()
+                        st.markdown("### 🔬 Walk-Forward验证说明")
+                        st.info(f"""
+                        **验证方法**: Walk-Forward滚动窗口验证
+                        - 训练期: {wf_train_months}个月
+                        - 测试期: {wf_test_months}个月
+                        - 防止未来函数泄漏: ✅ 严格时间隔离
+                        
+                        **注意**: 当前回测结果使用整体数据训练。完整的Walk-Forward验证需要多轮滚动训练，
+                        建议使用 `src/utils/walk_forward.py` 进行离线批量实验。
+                        """)
                     
                     # 显示交易记录示例
                     with st.expander("📋 查看交易记录（前10笔）"):

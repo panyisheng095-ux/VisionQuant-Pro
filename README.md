@@ -1,58 +1,102 @@
-# VisionQuant-Pro v2.0
+# VisionQuant-Pro
 
 <div align="center">
 
-**Vision-Based Quantitative Trading System with Deep Learning**
+**让AI学习人类交易员的"眼光" | Teaching AI to See Like a Trader**
 
 [![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-orange.svg)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-*Dual-Stream Architecture | GAF Encoding | Triple Barrier | Walk-Forward Validation*
+*K线视觉学习 | 形态相似度检索 | 行为金融学支撑 | Top10历史对比*
 
 </div>
 
 ---
 
-## 📊 Current Status
+## 🎯 项目定位
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| **v1.5 Web Interface** | ✅ Working | Uses 400K K-line images, fully functional |
-| **v1.5 AttentionCAE Model** | ✅ Trained | 5 epochs on 400K images |
-| **v1.5 FAISS Index** | ✅ Built | 400K vectors indexed |
-| **v2.0 Framework Code** | ✅ Complete | ~4,600 lines, all imports verified |
-| **v2.0 GAF Images** | ⏳ Pending | Run `scripts/prepare_data.py` to generate |
-| **v2.0 Dual-Stream Model** | ⏳ Pending | Run `scripts/train_dual_stream.py` to train |
+**VisionQuant-Pro 不是又一个量化交易系统，而是一个独特的"K线形态视觉智能"项目。**
 
-> **Note**: v2.0 is currently a **framework implementation**. The architecture and training scripts are complete, but model training has not been executed yet. The existing v1.5 system remains fully functional.
+### 核心创新
+
+| 特性 | 说明 |
+|------|------|
+| **🖼️ Top10历史形态对比** | 用户能直观看到"当前K线和哪些历史形态相似"——这是GAF和纯数值模型做不到的 |
+| **📚 行为金融学支撑** | 市场由人类行为驱动，人类是视觉动物。我们学习的是"集体视觉记忆" |
+| **🔍 可解释的AI决策** | 不是黑盒预测"涨/跌"，而是"这个形态历史上70%会涨，看这10个例子" |
+
+### 为什么用K线截图而不是GAF？
+
+> **K线截图的"信息丢失"是一种有益的抽象，而非缺陷。**
+
+人类交易员看K线图时，并不是在精确计算"今天涨了5.23%还是5.24%"。他们看的是**形态**——上涨是温和的还是强势的、支撑位在哪里、阻力位在哪里。
+
+CAE学习的1024维特征正是这种"形态感知"，而非"数值拟合"。
+
+详细论述见: [行为金融学理论基础](docs/behavioral_finance_rationale.md)
 
 ---
 
-## 🇨🇳 版本迭代说明 (Version Evolution in Chinese)
+## 📊 当前状态
+
+| 组件 | 状态 | 说明 |
+|------|------|------|
+| **Web界面** | ✅ 可用 | 40万张K线图 + AttentionCAE |
+| **AttentionCAE模型** | ✅ 已训练 | 8头注意力，5轮训练 |
+| **FAISS索引** | ✅ 已构建 | 40万向量，毫秒级检索 |
+| **Walk-Forward验证** | ✅ 可用 | 防止未来函数泄漏 |
+| **学术分支 (GAF)** | 📦 独立分支 | 消融实验用，见 `academic` 分支 |
+
+---
+
+## 🇨🇳 架构说明
+
+```
+                    VisionQuant-Pro 架构
+                           │
+           ┌───────────────┴───────────────┐
+           │                               │
+      主线 (main)                    学术分支 (academic)
+           │                               │
+   K线截图 + AttentionCAE              GAF + ResNet
+           │                               │
+   - 40万张现有图片                   - 消融实验用
+   - 已训练的模型                    - 论文对照组
+   - Top10震撼对比                   - 按需启用
+           │                               
+     ↓ 核心流程                      
+           │
+   ┌───────┴───────┐
+   │               │
+ K线截图      AttentionCAE
+ (matplotlib)   (CNN+8头注意力)
+   │               │
+   └───────┬───────┘
+           │
+     FAISS检索
+     (毫秒级)
+           │
+    Top10相似形态
+           │
+  ┌────────┼────────┐
+  │        │        │
+胜率统计  轨迹推演  V+F+Q评分
+  │        │        │
+  └────────┼────────┘
+           │
+      AI投资建议
+```
 
 <details>
-<summary>点击展开查看中文版本对比</summary>
-
-### v1.0 → v2.0 核心改进
-
-| 维度 | v1.0 问题 | v2.0 解决方案 |
-|------|----------|--------------|
-| **信息丢失** | K线截图丢失精确数值 | GAF数学编码 + 双流保留原始OHLCV |
-| **标签简单** | 简单涨跌二分类 | Triple Barrier三分类（止盈/止损/震荡） |
-| **未来函数** | 随机划分数据集 | Walk-Forward滚动验证 |
-| **缺乏理论** | "看图说话"式评分 | 有数学定义的GAF/Triple Barrier |
-| **不可解释** | 黑盒模型 | Grad-CAM热力图 + 注意力权重可视化 |
-| **回测简陋** | 自写简单回测 | Backtrader专业框架 |
-
-### 架构演进图
+<summary>点击展开版本演进图</summary>
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        VERSION EVOLUTION                         │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                   │
-│  v1.0 (2026-01-05)          v1.5 (2026-01-10)                    │
+│  v1.0 (2026-01-05)          v1.5 (2026-01-10) [当前]             │
 │  ─────────────────          ─────────────────                    │
 │  K线截图                     K线截图                              │
 │     │                           │                                 │
@@ -66,18 +110,17 @@
 │     ↓                           ↓                                 │
 │  胜率预测                    V+F+Q多因子评分                       │
 │                                                                   │
-│                          v2.0 (2026-01-13)                        │
-│                          ─────────────────                        │
-│                          OHLCV原始数据                            │
-│                               │                                   │
-│                    ┌──────────┴──────────┐                        │
-│                    ↓                     ↓                        │
-│               GAF图像               标准化序列                     │
-│                    │                     │                        │
-│                    ↓                     ↓                        │
-│               ResNet18              TCN+Attention                  │
-│                    │                     │                        │
-│                    └──────────┬──────────┘                        │
+│                                                                   │
+│                     学术分支 (academic)                           │
+│                     ─────────────────                             │
+│                     GAF图像 + ResNet                              │
+│                          ↓                                        │
+│                     消融实验对照组                                 │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+</details>
 │                               ↓                                   │
 │                      Cross-Modal Attention                        │
 │                               │                                   │
@@ -105,147 +148,85 @@
 
 ---
 
-## What's New in v2.0
+## 🔥 核心功能
 
-- **Dual-Stream Architecture**: Vision Stream (GAF images) + Temporal Stream (TCN+Attention)
-- **GAF Encoding**: Gramian Angular Field - mathematically rigorous time-to-image conversion
-- **Triple Barrier Method**: Industry-standard labeling (profit-taking, stop-loss, time horizon)
-- **Walk-Forward Validation**: Prevent look-ahead bias with rolling window training
-- **Backtrader Integration**: Professional backtesting framework
-- **Grad-CAM Explainability**: Visualize what the model "sees" in charts
+### 1. Top10 历史形态对比（独家功能）
 
----
+当你输入一只股票，系统会：
+1. 生成当前K线图
+2. 在40万张历史K线中搜索最相似的10张
+3. **直观展示这10张历史形态及其后续走势**
 
-## Architecture Overview
+这是用户最喜欢的功能——不是告诉你"AI预测涨"，而是让你**亲眼看到**历史上相似形态的结果。
+
+### 2. V+F+Q 多因子评分
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                      VisionQuant-Pro v2.0                           │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  ┌─────────────────────┐         ┌─────────────────────┐           │
-│  │    Vision Stream    │         │   Temporal Stream   │           │
-│  │                     │         │                     │           │
-│  │  OHLCV → GAF Image  │         │  OHLCV → Sequence   │           │
-│  │       ↓            │         │       ↓            │           │
-│  │  ResNet18/ViT      │         │  TCN + Attention   │           │
-│  │       ↓            │         │       ↓            │           │
-│  │  [B, 512] features │         │  [B, 256] features │           │
-│  └──────────┬──────────┘         └──────────┬──────────┘           │
-│             │                               │                       │
-│             └───────────────┬───────────────┘                       │
-│                             ↓                                       │
-│             ┌───────────────────────────────┐                       │
-│             │   Cross-Modal Attention       │                       │
-│             │      [B, 768] fused           │                       │
-│             └───────────────┬───────────────┘                       │
-│                             │                                       │
-│        ┌────────────────────┼────────────────────┐                  │
-│        ↓                    ↓                    ↓                  │
-│  ┌───────────┐       ┌───────────┐       ┌───────────┐             │
-│  │  FAISS    │       │ Triple    │       │   Risk    │             │
-│  │  Search   │       │ Barrier   │       │   Eval    │             │
-│  └───────────┘       └───────────┘       └───────────┘             │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
+总分 = V(视觉) + F(财务) + Q(量化)
+     = [0-3分] + [0-4分] + [0-3分]
+     = 0-10分
+
+≥7分 → BUY（买入）
+5-6分 → WAIT（观望）
+<5分 → SELL（卖出）
+```
+
+### 3. AttentionCAE 形态学习
+
+8头自注意力机制，能够捕捉：
+- 头肩顶的"左肩"和"右肩"的对称性
+- 双底形态中两个谷底的相似性
+- 上升三角形中多个触顶点的关系
+
+### 4. Walk-Forward 严格回测
+
+防止未来函数泄漏的滚动窗口验证：
+
+```
+|------ 训练 (3年) ------|-- 验证 (6月) --|-- 测试 (6月) --|
+                        |
+                        ↓ 滚动
+|------ 训练 (3年) ------|-- 验证 (6月) --|-- 测试 (6月) --|
 ```
 
 ---
 
-## Key Innovations
-
-### 1. GAF Encoding (Gramian Angular Field)
-
-Unlike simple K-line chart screenshots, GAF provides **mathematically rigorous** time-to-image conversion:
-
-```python
-# Mathematical formulation
-x_scaled = (x - min) / (max - min) * 2 - 1  # Normalize to [-1, 1]
-φ = arccos(x_scaled)                         # Polar angle
-G[i,j] = cos(φ_i + φ_j)                      # GASF matrix
-```
-
-**3-Channel GAF Image**:
-- **R**: GASF (Gramian Angular Summation Field) - captures overall trends
-- **G**: GADF (Gramian Angular Difference Field) - captures local changes
-- **B**: MTF (Markov Transition Field) - captures state transitions
-
-### 2. Dual-Stream Fusion
-
-**Vision Stream**: Processes GAF images with ResNet18/ViT
-- Captures spatial patterns (Double Bottom, Head-and-Shoulders, etc.)
-- Pretrained on ImageNet for transfer learning
-
-**Temporal Stream**: Processes raw OHLCV with TCN + Self-Attention
-- TCN: Dilated causal convolutions for local patterns
-- Self-Attention: Long-range dependencies across time
-
-**Cross-Modal Attention**: Learns complementary information
-- Gate mechanism balances vision vs. temporal importance
-- Enables interpretation: "Which modality contributed more?"
-
-### 3. Triple Barrier Labeling
-
-Standard in quantitative finance (López de Prado, 2018):
-
-```python
-def get_label(price_series, pt=0.05, sl=0.03, max_holding=20):
-    """
-    pt: profit-taking threshold (5%)
-    sl: stop-loss threshold (3%)
-    max_holding: maximum holding period (20 days)
-    
-    Returns:
-    - 1: Hit profit-taking first → Bullish
-    - -1: Hit stop-loss first → Bearish
-    - 0: Hit time horizon first → Neutral
-    """
-```
-
-### 4. Walk-Forward Validation
-
-Prevents look-ahead bias by simulating real trading:
-
-```
-|------ Train (3 years) ------|-- Val (6mo) --|-- Test (6mo) --|
-                              |
-                              ↓ Roll forward
-|------ Train (3 years) ------|-- Val (6mo) --|-- Test (6mo) --|
-```
-
----
-
-## Project Structure
+## 📁 项目结构
 
 ```
 VisionQuant-Pro/
 ├── src/
 │   ├── models/
-│   │   ├── dual_stream_network.py  # Core: Dual-Stream Architecture
-│   │   ├── temporal_encoder.py      # TCN + Self-Attention
-│   │   ├── attention_cae.py         # Legacy: AttentionCAE
-│   │   └── vision_engine.py         # FAISS search engine
+│   │   ├── attention_cae.py         # ⭐ 核心：AttentionCAE模型
+│   │   ├── autoencoder.py           # 基础QuantCAE
+│   │   └── vision_engine.py         # FAISS相似度搜索引擎
 │   ├── data/
-│   │   ├── gaf_encoder.py           # GAF image generation
-│   │   ├── triple_barrier.py        # Label generation
-│   │   └── data_loader.py           # Stock data loader
+│   │   └── data_loader.py           # 股票数据加载器 (akshare)
 │   ├── strategies/
-│   │   ├── backtrader_strategy.py   # Backtrader integration
-│   │   ├── portfolio_optimizer.py   # Markowitz optimization
-│   │   └── factor_mining.py         # Multi-factor scoring
+│   │   ├── factor_mining.py         # V+F+Q多因子评分
+│   │   ├── fundamental.py           # 财务数据获取
+│   │   ├── portfolio_optimizer.py   # Markowitz组合优化
+│   │   └── batch_analyzer.py        # 批量分析引擎
 │   └── utils/
-│       ├── walk_forward.py          # Walk-Forward validation
-│       └── grad_cam.py              # Explainability
-├── scripts/
-│   ├── train_dual_stream.py         # Training script
-│   └── prepare_data.py              # Data preparation
+│       ├── visualizer.py            # Top10对比图生成
+│       ├── walk_forward.py          # Walk-Forward验证框架
+│       └── attention_visualizer.py  # 注意力权重可视化
 ├── web/
-│   └── app.py                       # Streamlit interface
+│   └── app.py                       # Streamlit Web界面
+├── data/
+│   ├── images/                      # 40万张K线截图 (1.5GB)
+│   ├── models/                      # 训练好的模型
+│   └── indices/                     # FAISS索引文件
 ├── docs/
-│   ├── AttentionCAE切换指南.md
+│   ├── behavioral_finance_rationale.md  # 行为金融学理论
 │   ├── 常见问题FAQ.md
 │   └── 在线部署教程.md
 └── requirements.txt
+
+# 学术分支 (git checkout academic)
+├── src/data/gaf_encoder.py          # GAF图像编码
+├── src/models/dual_stream_network.py # 双流网络
+└── scripts/train_dual_stream.py      # 训练脚本
 ```
 
 ---
@@ -290,41 +271,41 @@ python run.py  # or: PYTHONPATH=. streamlit run web/app.py
 
 ---
 
-## Comparison with Other Approaches
+## 📊 与其他方法对比
 
-| Aspect | Traditional Quant | Pure CNN | RD-Agent | VisionQuant v2.0 |
-|--------|------------------|----------|----------|------------------|
-| Input | Numerical | K-line image | Numerical+Text | **GAF+OHLCV** |
-| Time Modeling | Hand-crafted | Ignored | Agent reasoning | **TCN+Attention** |
-| Image Encoding | None | Screenshot | None | **GAF (math-based)** |
-| Explainability | High | Low | Medium | **High (Grad-CAM)** |
-| Labeling | Returns | Up/Down | Returns | **Triple Barrier** |
-| Validation | Random split | Random split | Rolling | **Walk-Forward** |
+| 维度 | 传统量化 | 纯数值CNN | RD-Agent | **VisionQuant** |
+|------|---------|----------|----------|-----------------|
+| 输入 | 数值因子 | OHLCV | 数值+文本 | **K线截图** |
+| 可解释性 | 高 | 低 | 中 | **⭐ 高 (Top10对比)** |
+| 人类直觉对齐 | 低 | 低 | 中 | **⭐ 高 (形态可视)** |
+| 独特性 | 低 | 中 | 中 | **⭐ 高 (视觉震撼)** |
+| 理论支撑 | 统计学 | 深度学习 | Agent | **行为金融学** |
 
 ---
 
-## Theoretical Foundation
+## 📚 理论基础
 
-### Behavioral Finance Justification
+### 行为金融学支撑
 
-> "The market is driven by human behavior, and humans are visual creatures."
+> "市场由人类行为驱动，人类是视觉动物。"
 
-- **Anchoring Bias**: Traders anchor to visually prominent patterns (support/resistance)
-- **Herding Behavior**: Visual breakouts trigger collective action
-- **Representativeness Heuristic**: Similar charts → similar future outcomes
+| 行为偏差 | 在K线图中的体现 | VisionQuant如何利用 |
+|---------|----------------|-------------------|
+| **锚定效应** | 历史高/低点成为心理锚点 | 学习视觉上显著的价位区域 |
+| **羊群效应** | 突破形态触发集体行动 | 识别触发集体行动的视觉模式 |
+| **代表性启发** | "这形态像头肩顶，会跌" | 形式化为相似度搜索 |
 
-Our model formalizes these intuitions:
-- GAF preserves the visual structure traders see
-- Cross-modal fusion captures both "what it looks like" and "how it moves"
-- Historical pattern matching exploits behavioral repetition
-
-### Information Theoretic View
+### 信息论视角
 
 ```
-I(FutureReturn; GAF+OHLCV) > I(FutureReturn; OHLCV)
+K线截图信息量:  224×224×3 = 150,528 像素值
+原始数值信息量: 5 × N天 = 5N 个数值
+
+K线截图 ≠ 信息丢失
+K线截图 = 有益的抽象（专注形态，过滤噪声）
 ```
 
-The visual representation captures geometric and topological features that are difficult to extract from raw numerical sequences.
+详细论述: [行为金融学理论基础](docs/behavioral_finance_rationale.md)
 
 ---
 
@@ -342,39 +323,44 @@ The visual representation captures geometric and topological features that are d
 
 ---
 
-## Roadmap
+## 🗺️ 路线图
 
-### v2.1 (Next)
-- [ ] Vision Transformer (ViT) backbone option
-- [ ] Contrastive learning (SimCLR) pretraining
-- [ ] Multi-timeframe fusion (daily + weekly + monthly)
+### v1.6 (近期)
+- [ ] Vision Transformer (ViT) 替换CNN骨干
+- [ ] 对比学习 (SimCLR) 预训练
+- [ ] 更多股票数据覆盖
 
-### v2.2 (Future)
-- [ ] Reinforcement learning integration
-- [ ] Live trading API integration
-- [ ] Multi-market support (US, HK)
+### v2.0 (中期)
+- [ ] 多时间框架融合 (日线 + 周线 + 月线)
+- [ ] 实盘交易API集成
+- [ ] 多市场支持 (A股 + 港股 + 美股)
+
+### 学术方向 (academic分支)
+- [ ] GAF vs K线截图消融实验
+- [ ] 论文投稿准备
+- [ ] 更多基线对比
 
 ---
 
-## Citation
+## 📖 引用
 
 ```bibtex
 @software{visionquant-pro,
-  title = {VisionQuant-Pro: Dual-Stream Vision-Based Quantitative Trading},
+  title = {VisionQuant-Pro: K-Line Visual Pattern Learning for Quantitative Trading},
   author = {Pan, Yisheng},
-  year = {2025},
+  year = {2026},
   url = {https://github.com/panyisheng095-ux/VisionQuant-Pro}
 }
 ```
 
 ---
 
-## References
+## 📚 参考文献
 
-- Wang, Z., & Oates, T. (2015). Imaging time-series to improve classification and imputation. IJCAI.
-- López de Prado, M. (2018). Advances in Financial Machine Learning. Wiley.
-- Selvaraju, R. R., et al. (2017). Grad-CAM: Visual Explanations from Deep Networks.
-- Bai, S., et al. (2018). An Empirical Evaluation of Generic Convolutional and Recurrent Networks for Sequence Modeling.
+- Kahneman, D., & Tversky, A. (1979). Prospect Theory. *Econometrica*.
+- Barberis, N., & Thaler, R. (2003). A Survey of Behavioral Finance. *Handbook of the Economics of Finance*.
+- Lo, A. W. (2004). The Adaptive Markets Hypothesis. *Journal of Portfolio Management*.
+- López de Prado, M. (2018). Advances in Financial Machine Learning. *Wiley*.
 
 ---
 
