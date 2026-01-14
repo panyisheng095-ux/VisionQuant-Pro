@@ -289,14 +289,23 @@ if mode == "🔍 实盘深度研判":
             else:
                 mean_path, avg_ret, traditional_win_rate = np.zeros(6), 0.0, 50.0
 
-            # 使用混合胜率（如果Triple Barrier标签可用，否则使用传统胜率）
+            # 3. 使用新的K线因子计算器（混合胜率）
+            hybrid_win_rate_result = None
+            hybrid_win_rate = None
             try:
-                if 'hybrid_win_rate' in locals() and not np.isnan(hybrid_win_rate):
-                    win_rate = hybrid_win_rate
+                kline_factor_calc = KLineFactorCalculator()
+                hybrid_win_rate_result = kline_factor_calc.calculate_hybrid_win_rate(matches, df)
+                if hybrid_win_rate_result and 'hybrid_win_rate' in hybrid_win_rate_result:
+                    hybrid_win_rate = hybrid_win_rate_result.get('hybrid_win_rate', traditional_win_rate)
                 else:
-                    win_rate = traditional_win_rate
-            except:
-                win_rate = traditional_win_rate
+                    hybrid_win_rate = traditional_win_rate
+            except Exception as e:
+                # 如果Triple Barrier标签不可用，使用传统胜率
+                hybrid_win_rate = traditional_win_rate
+                hybrid_win_rate_result = None
+            
+            # 使用混合胜率（如果可用）
+            win_rate = hybrid_win_rate if hybrid_win_rate is not None else traditional_win_rate
 
             # 3. 因子与新闻
             df_f = eng["factor"]._add_technical_indicators(df)
@@ -342,7 +351,7 @@ if mode == "🔍 实盘深度研判":
             }
             
             # 保存混合胜率信息（如果计算了）
-            if hybrid_win_rate_result:
+            if hybrid_win_rate_result and hybrid_win_rate is not None:
                 res_dict["hybrid_win_rate"] = hybrid_win_rate
                 res_dict["traditional_win_rate"] = traditional_win_rate
                 res_dict["tb_win_rate"] = hybrid_win_rate_result.get('tb_win_rate', 0)
