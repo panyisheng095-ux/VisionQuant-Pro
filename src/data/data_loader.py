@@ -2,6 +2,7 @@ import akshare as ak
 import pandas as pd
 import os
 import time
+import logging
 from tqdm import tqdm
 from datetime import datetime, timedelta
 from typing import Optional
@@ -11,10 +12,14 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))
 DATA_RAW_DIR = os.path.join(PROJECT_ROOT, "data", "raw")
 
+# 日志（不强行覆盖全局 logging 配置，交由入口处统一配置）
+logger = logging.getLogger(__name__)
+
 # 导入数据源适配器
 from .data_source import DataSource, AkshareDataSource
 from .jqdata_adapter import JQDataAdapter
 from .rqdata_adapter import RQDataAdapter
+from .quality_checker import DataQualityChecker
 
 
 class DataLoader:
@@ -44,6 +49,10 @@ class DataLoader:
         # 初始化数据源
         self.data_source_name = data_source
         self.data_source = self._init_data_source(data_source, **kwargs)
+        
+        # 初始化数据质量检查器
+        self.quality_checker = DataQualityChecker()
+        self.enable_quality_check = kwargs.get('enable_quality_check', True)
     
     def _init_data_source(self, source_name: str, **kwargs) -> DataSource:
         """
@@ -67,7 +76,7 @@ class DataLoader:
             password = kwargs.get('password') or kwargs.get('rq_password')
             return RQDataAdapter(username=username, password=password)
         else:
-            print(f"⚠️ 未知数据源: {source_name}，使用akshare作为默认")
+            logger.warning("未知数据源: %s，使用 akshare 作为默认", source_name)
             return AkshareDataSource()
     
     def switch_data_source(self, source_name: str, **kwargs):
@@ -80,7 +89,7 @@ class DataLoader:
         """
         self.data_source_name = source_name
         self.data_source = self._init_data_source(source_name, **kwargs)
-        print(f"✅ 已切换到数据源: {source_name}")
+        logger.info("已切换到数据源: %s", source_name)
     
     def get_current_data_source(self) -> str:
         """获取当前数据源名称"""
@@ -125,7 +134,8 @@ class DataLoader:
                         return df  # 数据已是最新，直接返回
                 else:
                     need_download = True
-            except:
+            except Exception as e:
+                logger.warning("读取本地缓存失败 %s (%s): %s", symbol, file_path, e)
                 need_download = True
         else:
             need_download = True
@@ -143,10 +153,24 @@ class DataLoader:
                 )
                 
                 if df_new is not None and not df_new.empty:
-                    # 保存到本地缓存
-                    if use_cache:
-                        df_new.to_csv(file_path)
-                    return df_new
+                    # 数据质量检查
+                    if self.enable_quality_check:
+                        quality_result = self.quality_checker.check_data_quality(df_new, symbol)
+                        if not quality_result['is_valid']:
+                            print(f"⚠️ [{symbol}] 数据质量检查未通过 (得分: {quality_result['score']}/100)")
+                            if quality_result['score'] < 50:
+                                print(f"  错误: {quality_result['errors']}")
+                                # 质量太差：优先使用旧数据；没有旧数据则继续走回退数据源逻辑
+                                if not df.empty:
+                                    return df  # 返回旧数据
+                                df_new = None  # 触发回退
+                    
+                    # 质量不通过且没有旧数据：继续走回退，不在此处保存/返回
+                    if df_new is not None and not df_new.empty:
+                        # 保存到本地缓存
+                        if use_cache:
+                            df_new.to_csv(file_path)
+                        return df_new
                 else:
                     print(f"⚠️ [{self.data_source_name}] 获取数据失败，尝试回退...")
             

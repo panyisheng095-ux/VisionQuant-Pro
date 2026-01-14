@@ -197,21 +197,39 @@ class KLineFactorCalculator:
             'message': '计算成功'
         }
     
-    def _calculate_traditional_win_rate(self, matches: List[Dict]) -> float:
+    def _calculate_traditional_win_rate(self, matches: List[Dict], horizon_days: int = 5) -> float:
         """
-        计算传统胜率（收益率>0的比例）
+        计算传统胜率（未来收益率>0 的比例，按相似度加权）
         
-        这是向后兼容的简化方法
+        说明：
+        - 与“简单计数平均”不同，这里使用 TopK 匹配的 score 作为权重（相似度越高权重越大）
+        - horizon_days 默认 5，与 Web UI 中“传统胜率：未来5日收益率>0 的比例”一致
         """
         if not self.data_loader:
             return 50.0
         
-        positive_count = 0
+        weighted_positive = 0.0
+        total_weight = 0.0
         valid_count = 0
         
+        # score 可能为负/尺度不一：统一做非负化，避免某些实现返回距离导致权重异常
+        scores = []
+        for m in matches:
+            try:
+                scores.append(float(m.get("score", 1.0)))
+            except Exception:
+                scores.append(1.0)
+        min_s = min(scores) if scores else 0.0
+        eps = 1e-6
+
         for match in matches:
             symbol = str(match.get('symbol', '')).zfill(6)
             date_str = str(match.get('date', ''))
+            try:
+                raw_score = float(match.get("score", 1.0))
+            except Exception:
+                raw_score = 1.0
+            weight = max(raw_score - min_s + eps, eps)
             
             try:
                 # 解析日期
@@ -232,23 +250,24 @@ class KLineFactorCalculator:
                 
                 loc = df.index.get_loc(match_date)
                 
-                # 计算未来20天收益率
-                if loc + 20 < len(df):
+                # 计算未来 horizon_days 收益率（默认 5 日）
+                if loc + horizon_days < len(df):
                     entry_price = df.iloc[loc]['Close']
-                    future_price = df.iloc[loc + 20]['Close']
+                    future_price = df.iloc[loc + horizon_days]['Close']
                     return_pct = (future_price - entry_price) / entry_price
                     
                     if return_pct > 0:
-                        positive_count += 1
+                        weighted_positive += weight
+                    total_weight += weight
                     valid_count += 1
                     
             except Exception:
                 continue
         
-        if valid_count == 0:
+        if valid_count == 0 or total_weight <= 0:
             return 50.0
         
-        return (positive_count / valid_count) * 100
+        return (weighted_positive / total_weight) * 100
     
     def _query_labels_from_hdf5(self, matches: List[Dict]) -> Dict:
         """
