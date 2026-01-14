@@ -113,7 +113,7 @@ with st.sidebar:
     symbol_input = st.text_input("请输入 A 股代码", value="601899", help="输入6位代码")
     symbol = symbol_input.strip().zfill(6)
 
-    mode = st.radio("功能模块:", ("🔍 实盘深度研判", "📊 批量组合分析", "🧪 策略模拟回测"))
+    mode = st.radio("功能模块:", ("🔍 实盘深度研判", "📊 批量组合分析", "🧪 策略模拟回测", "📈 因子有效性分析"))
 
     if mode == "📊 批量组合分析":
         st.divider()
@@ -260,6 +260,10 @@ if mode == "🔍 实盘深度研判":
             matches = eng["vision"].search_similar_patterns(q_p, top_k=10, query_prices=query_prices)
 
 
+            # 3. 使用新的K线因子计算器（混合胜率）
+            kline_factor_calc = KLineFactorCalculator()
+            hybrid_win_rate = kline_factor_calc.calculate_hybrid_win_rate(matches, df)
+            
             # 轨迹计算
             def get_future_trajectories(matches, loader):
                 trajectories, details = [], []
@@ -285,17 +289,43 @@ if mode == "🔍 实盘深度研判":
             if trajs:
                 mean_path = np.mean(np.vstack(trajs), axis=0)
                 avg_ret = mean_path[-1]
-                win_rate = np.sum(np.vstack(trajs)[:, -1] > 0) / len(trajs) * 100
+                traditional_win_rate = np.sum(np.vstack(trajs)[:, -1] > 0) / len(trajs) * 100
             else:
-                mean_path, avg_ret, win_rate = np.zeros(6), 0.0, 50.0
+                mean_path, avg_ret, traditional_win_rate = np.zeros(6), 0.0, 50.0
+
+            # 使用混合胜率（如果Triple Barrier标签可用，否则使用传统胜率）
+            try:
+                if 'hybrid_win_rate' in locals() and not np.isnan(hybrid_win_rate):
+                    win_rate = hybrid_win_rate
+                else:
+                    win_rate = traditional_win_rate
+            except:
+                win_rate = traditional_win_rate
 
             # 3. 因子与新闻
             df_f = eng["factor"]._add_technical_indicators(df)
             news_text = eng["news"].get_latest_news(symbol)
             ind_name, peers_df = eng["fund"].get_industry_peers(symbol)
 
-            # 4. 打分
-            total_score, initial_action, s_details = eng["factor"].get_scorecard(win_rate, df_f.iloc[-1], fund_data)
+            # 4. 打分（使用动态权重）
+            # 获取当前市场regime和动态权重
+            returns = df['Close'].pct_change().dropna()
+            try:
+                regime_weights = eng["regime_manager"].calculate_dynamic_weights(returns=returns)
+                dynamic_weights = regime_weights.get('weights', {})
+                current_regime = regime_weights.get('regime', 'unknown')
+            except:
+                dynamic_weights = None
+                current_regime = 'unknown'
+            
+            # 使用动态权重评分（如果可用）
+            if dynamic_weights:
+                total_score, initial_action, s_details = eng["factor"].get_scorecard(
+                    win_rate, df_f.iloc[-1], fund_data,
+                    returns=returns
+                )
+            else:
+                total_score, initial_action, s_details = eng["factor"].get_scorecard(win_rate, df_f.iloc[-1], fund_data)
 
             # 5. Agent
             report = eng["agent"].analyze(symbol, total_score, initial_action,
