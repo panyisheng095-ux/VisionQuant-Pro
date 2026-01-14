@@ -1212,42 +1212,67 @@ def _run_backtest_integrated(symbol, bt_start, bt_end, bt_cap, bt_ma, bt_stop, b
                             'trades': len(trade_log)
                         })
                 
-                # 显示Walk-Forward结果
+                # 显示Walk-Forward结果 - Google AI Studio风格
                 if all_results:
                     results_df = pd.DataFrame(all_results)
-                    st.dataframe(results_df, use_container_width=True)
                     
-                    # 绘制多fold结果
+                    # 显示结果表格
+                    st.markdown("### 📊 Walk-Forward验证结果")
+                    st.dataframe(results_df, use_container_width=True, height=300)
+                    
+                    # 绘制多fold结果 - Apple风格图表
                     fig = go.Figure()
                     fig.add_trace(go.Scatter(
                         x=results_df['fold'],
                         y=results_df['return'],
                         mode='lines+markers',
                         name='策略收益',
-                        line=dict(color='#ff4b4b', width=2)
+                        line=dict(color='#667eea', width=3),
+                        marker=dict(size=8, color='#667eea'),
+                        fill='tozeroy',
+                        fillcolor='rgba(102, 126, 234, 0.1)'
                     ))
                     fig.add_trace(go.Scatter(
                         x=results_df['fold'],
                         y=results_df['benchmark'],
                         mode='lines+markers',
                         name='基准收益',
-                        line=dict(color='gray', dash='dash')
+                        line=dict(color='#9ca3af', width=2, dash='dash'),
+                        marker=dict(size=6, color='#9ca3af')
                     ))
                     fig.update_layout(
                         title=f"Walk-Forward验证结果（{fold_count}个fold，训练期{wf_train_months}月，测试期{wf_test_months}月）",
                         xaxis_title="Fold",
                         yaxis_title="收益率 (%)",
-                        height=400
+                        height=450,
+                        plot_bgcolor='rgba(255, 255, 255, 0.9)',
+                        paper_bgcolor='rgba(255, 255, 255, 0)',
+                        font=dict(family='-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif', size=12),
+                        hovermode='x unified',
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
                     )
                     st.plotly_chart(fig, config={"displayModeBar": False}, use_container_width=True)
                     
+                    # 统计指标 - Apple风格
                     avg_return = results_df['return'].mean()
                     avg_alpha = results_df['alpha'].mean()
-                    col1, col2 = st.columns(2)
-                    col1.metric("平均收益率", f"{avg_return:.2f}%")
-                    col2.metric("平均Alpha", f"{avg_alpha:.2f}%")
+                    std_return = results_df['return'].std()
+                    win_rate = (results_df['return'] > 0).sum() / len(results_df) * 100
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("平均收益率", f"{avg_return:.2f}%", 
+                                 delta=f"±{std_return:.2f}%")
+                    with col2:
+                        st.metric("平均Alpha", f"{avg_alpha:.2f}%",
+                                 delta="超额收益" if avg_alpha > 0 else "跑输基准")
+                    with col3:
+                        st.metric("胜率", f"{win_rate:.1f}%",
+                                 delta="优秀" if win_rate > 60 else "一般")
+                    with col4:
+                        st.metric("Fold数量", f"{fold_count}个")
                 else:
-                    st.warning("Walk-Forward验证未生成结果，可能数据不足")
+                    st.warning("⚠️ Walk-Forward验证未生成结果，可能数据不足")
             else:
                 # 简单回测（原有逻辑）
                 if len(df_bt) > 50:
@@ -1321,24 +1346,53 @@ def _run_backtest_integrated(symbol, bt_start, bt_end, bt_cap, bt_ma, bt_stop, b
                         
                         equity.append(cash + shares * p)
                     
+                    # 绘制收益曲线 - Google AI Studio风格
                     fig = go.Figure()
-                    fig.add_trace(go.Scatter(x=df_bt.index, y=equity, name="VQ 策略", 
-                                           line=dict(color='#ff4b4b', width=2)))
+                    fig.add_trace(go.Scatter(
+                        x=df_bt.index, 
+                        y=equity, 
+                        name="VQ 策略", 
+                        line=dict(color='#667eea', width=3),
+                        fill='tozeroy',
+                        fillcolor='rgba(102, 126, 234, 0.1)'
+                    ))
                     bench = (df_bt['Close'] / df_bt['Close'].iloc[0]) * bt_cap
-                    fig.add_trace(go.Scatter(x=df_bt.index, y=bench, name="基准（买入持有）", 
-                                           line=dict(color='gray', dash='dash')))
-                    fig.update_layout(title="策略收益曲线", height=400)
+                    fig.add_trace(go.Scatter(
+                        x=df_bt.index, 
+                        y=bench, 
+                        name="基准（买入持有）", 
+                        line=dict(color='#9ca3af', width=2, dash='dash')
+                    ))
+                    fig.update_layout(
+                        title="📈 策略收益曲线",
+                        height=450,
+                        plot_bgcolor='rgba(255, 255, 255, 0.9)',
+                        paper_bgcolor='rgba(255, 255, 255, 0)',
+                        font=dict(family='-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif', size=12),
+                        hovermode='x unified',
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                    )
                     st.plotly_chart(fig, config={"displayModeBar": False}, use_container_width=True)
                     
                     ret = (equity[-1] - bt_cap) / bt_cap * 100
                     bench_ret = (df_bt['Close'].iloc[-1] - df_bt['Close'].iloc[0]) / df_bt['Close'].iloc[0] * 100
                     alpha = ret - bench_ret
+                    sharpe = (ret / 100) / (np.std(np.diff(equity)) / np.mean(equity)) if len(equity) > 1 and np.std(np.diff(equity)) > 0 else 0
                     
+                    # 指标展示 - Apple风格
                     col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("策略收益率", f"{ret:.2f}%")
-                    col2.metric("Alpha", f"{alpha:.2f}%", delta=f"{alpha:.2f}%")
-                    col3.metric("交易次数", len(trade_log))
-                    col4.metric("数据来源", "有AI数据" if vision_map else "无AI数据")
+                    with col1:
+                        st.metric("策略收益率", f"{ret:.2f}%", 
+                                 delta=f"{alpha:.2f}% vs 基准", 
+                                 delta_color="normal" if alpha > 0 else "inverse")
+                    with col2:
+                        st.metric("Alpha", f"{alpha:.2f}%",
+                                 delta="超额收益" if alpha > 0 else "跑输基准")
+                    with col3:
+                        st.metric("交易次数", f"{len(trade_log)}次")
+                    with col4:
+                        st.metric("夏普比率", f"{sharpe:.2f}" if sharpe > 0 else "N/A",
+                                 delta="优秀" if sharpe > 1.5 else "一般")
                 else:
                     st.error("数据不足")
         else:
