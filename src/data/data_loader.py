@@ -4,30 +4,105 @@ import os
 import time
 from tqdm import tqdm
 from datetime import datetime, timedelta
+from typing import Optional
 
 # === 路径配置 ===
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))
 DATA_RAW_DIR = os.path.join(PROJECT_ROOT, "data", "raw")
 
+# 导入数据源适配器
+from .data_source import DataSource, AkshareDataSource
+from .jqdata_adapter import JQDataAdapter
+from .rqdata_adapter import RQDataAdapter
+
 
 class DataLoader:
-    def __init__(self):
+    """
+    数据加载器（支持多数据源切换）
+    
+    支持的数据源：
+    - 'akshare': 免费数据源（默认）
+    - 'jqdata': 聚宽数据源（需要认证）
+    - 'rqdata': 米筐数据源（需要认证）
+    """
+    
+    def __init__(self, data_source: str = 'akshare', **kwargs):
+        """
+        初始化数据加载器
+        
+        Args:
+            data_source: 数据源名称 ('akshare', 'jqdata', 'rqdata')
+            **kwargs: 数据源特定参数
+                - 对于jqdata: username, password
+                - 对于rqdata: username, password
+        """
         if not os.path.exists(DATA_RAW_DIR):
             os.makedirs(DATA_RAW_DIR)
         self.data_dir = DATA_RAW_DIR
-
-    def get_stock_data(self, symbol, start_date="20200101", end_date=None, adjust="qfq"):
+        
+        # 初始化数据源
+        self.data_source_name = data_source
+        self.data_source = self._init_data_source(data_source, **kwargs)
+    
+    def _init_data_source(self, source_name: str, **kwargs) -> DataSource:
         """
-        [智能更新版] 获取股票数据
+        初始化数据源
+        
+        Args:
+            source_name: 数据源名称
+            **kwargs: 数据源参数
+            
+        Returns:
+            DataSource实例
+        """
+        if source_name == 'akshare':
+            return AkshareDataSource()
+        elif source_name == 'jqdata':
+            username = kwargs.get('username') or kwargs.get('jq_username')
+            password = kwargs.get('password') or kwargs.get('jq_password')
+            return JQDataAdapter(username=username, password=password)
+        elif source_name == 'rqdata':
+            username = kwargs.get('username') or kwargs.get('rq_username')
+            password = kwargs.get('password') or kwargs.get('rq_password')
+            return RQDataAdapter(username=username, password=password)
+        else:
+            print(f"⚠️ 未知数据源: {source_name}，使用akshare作为默认")
+            return AkshareDataSource()
+    
+    def switch_data_source(self, source_name: str, **kwargs):
+        """
+        切换数据源
+        
+        Args:
+            source_name: 新数据源名称
+            **kwargs: 数据源参数
+        """
+        self.data_source_name = source_name
+        self.data_source = self._init_data_source(source_name, **kwargs)
+        print(f"✅ 已切换到数据源: {source_name}")
+    
+    def get_current_data_source(self) -> str:
+        """获取当前数据源名称"""
+        return self.data_source_name
+
+    def get_stock_data(self, symbol, start_date="20200101", end_date=None, adjust="qfq", use_cache=True):
+        """
+        [智能更新版] 获取股票数据（支持多数据源）
+        
         逻辑：
-        1. 本地无文件 -> 下载
-        2. 本地有文件 -> 检查最新日期
-           - 如果数据滞后 -> 重新下载覆盖 (保持数据最新)
-           - 如果数据是最新的 -> 直接读取 (极速)
+        1. 如果use_cache=True，先检查本地缓存
+        2. 如果数据滞后或不存在，从当前数据源下载
+        3. 如果当前数据源不可用，回退到akshare
+        
+        Args:
+            symbol: 股票代码
+            start_date: 开始日期
+            end_date: 结束日期
+            adjust: 复权类型
+            use_cache: 是否使用本地缓存
         """
         if end_date is None:
-            # 获取当前现实世界的日期
             end_date = datetime.now().strftime("%Y%m%d")
 
         symbol = str(symbol).strip().zfill(6)
@@ -36,24 +111,18 @@ class DataLoader:
         need_download = False
         df = pd.DataFrame()
 
-        # === 1. 检查本地缓存 ===
-        if os.path.exists(file_path):
+        # === 1. 检查本地缓存（如果启用） ===
+        if use_cache and os.path.exists(file_path):
             try:
                 df = pd.read_csv(file_path, index_col=0, parse_dates=True)
                 if not df.empty:
-                    # 获取本地数据的最后一天
                     last_date_in_file = df.index[-1].date()
                     today = datetime.now().date()
-
-                    # 如果今天是周末，我们要往前推到最近的交易日（简单处理：如果最后日期 < 昨天，就更新）
-                    # 严谨逻辑：如果最后一条数据不是今天(或最近交易日)，就更新
-                    # 这里为了简化：只要最后日期小于今天，就尝试更新
+                    
                     if last_date_in_file < today:
-                        # print(f"🔄 数据滞后 ({last_date_in_file})，正在更新 {symbol}...")
                         need_download = True
                     else:
-                        # print(f"✅ 数据已是最新 ({last_date_in_file})")
-                        need_download = False
+                        return df  # 数据已是最新，直接返回
                 else:
                     need_download = True
             except:
@@ -61,44 +130,66 @@ class DataLoader:
         else:
             need_download = True
 
-        # === 2. 执行下载 (如果需要) ===
+        # === 2. 从数据源下载（如果需要） ===
         if need_download:
-            print(f"⬇️ [联网更新] 正在拉取 {symbol} 最新行情...")
-            try:
-                # 重新下载全量数据 (覆盖模式)
-                # AkShare 接口很快，直接覆盖比增量append更不容易出错
-                df_new = ak.stock_zh_a_hist(symbol=symbol, period="daily",
-                                            start_date=start_date, end_date=end_date, adjust=adjust)
-
-                if df_new is None or df_new.empty:
-                    # 如果下载失败但本地有旧数据，就暂时用旧的
-                    if not df.empty:
-                        print(f"⚠️ 网络下载失败，降级使用本地旧数据")
-                        return df
-                    return pd.DataFrame()
-
-                # 格式化
-                rename_map = {
-                    "日期": "Date", "开盘": "Open", "收盘": "Close",
-                    "最高": "High", "最低": "Low", "成交量": "Volume"
-                }
-                df_new = df_new.rename(columns=rename_map)
-                df_new['Date'] = pd.to_datetime(df_new['Date'])
-                df_new.set_index('Date', inplace=True)
-
-                # 保存覆盖
-                df_new.to_csv(file_path)
-                return df_new
-
-            except Exception as e:
-                print(f"❌ 更新失败: {e}")
-                if not df.empty: return df  # 返回旧数据兜底
-                return pd.DataFrame()
+            # 尝试从当前数据源获取
+            if self.data_source and self.data_source.is_available():
+                print(f"⬇️ [{self.data_source_name}] 正在拉取 {symbol} 最新行情...")
+                df_new = self.data_source.get_stock_data(
+                    symbol=symbol,
+                    start_date=start_date,
+                    end_date=end_date,
+                    adjust=adjust
+                )
+                
+                if df_new is not None and not df_new.empty:
+                    # 保存到本地缓存
+                    if use_cache:
+                        df_new.to_csv(file_path)
+                    return df_new
+                else:
+                    print(f"⚠️ [{self.data_source_name}] 获取数据失败，尝试回退...")
+            
+            # 回退到akshare（如果当前不是akshare）
+            if self.data_source_name != 'akshare':
+                print(f"🔄 回退到akshare数据源...")
+                fallback_source = AkshareDataSource()
+                if fallback_source.is_available():
+                    df_new = fallback_source.get_stock_data(
+                        symbol=symbol,
+                        start_date=start_date,
+                        end_date=end_date,
+                        adjust=adjust
+                    )
+                    if df_new is not None and not df_new.empty:
+                        if use_cache:
+                            df_new.to_csv(file_path)
+                        return df_new
+            
+            # 如果所有数据源都失败，返回旧数据（如果有）
+            if not df.empty:
+                print(f"⚠️ 所有数据源获取失败，使用本地旧数据")
+                return df
+            
+            return pd.DataFrame()
 
         return df
 
     def get_top300_stocks(self):
         """获取全A股列表并按市值排序"""
+        # 优先使用当前数据源
+        if self.data_source and self.data_source.is_available():
+            try:
+                stock_list = self.data_source.get_stock_list()
+                if not stock_list.empty:
+                    # 如果有市值信息，按市值排序
+                    if 'market_cap' in stock_list.columns:
+                        stock_list = stock_list.sort_values(by='market_cap', ascending=False)
+                    return stock_list.head(300)
+            except Exception as e:
+                print(f"⚠️ [{self.data_source_name}] 获取股票列表失败: {e}")
+        
+        # 回退到akshare
         try:
             df = ak.stock_zh_a_spot_em()
             if '总市值' in df.columns:
