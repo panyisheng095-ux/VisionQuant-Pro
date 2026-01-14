@@ -260,10 +260,6 @@ if mode == "🔍 实盘深度研判":
             matches = eng["vision"].search_similar_patterns(q_p, top_k=10, query_prices=query_prices)
 
 
-            # 3. 使用新的K线因子计算器（混合胜率）
-            kline_factor_calc = KLineFactorCalculator()
-            hybrid_win_rate = kline_factor_calc.calculate_hybrid_win_rate(matches, df)
-            
             # 轨迹计算
             def get_future_trajectories(matches, loader):
                 trajectories, details = [], []
