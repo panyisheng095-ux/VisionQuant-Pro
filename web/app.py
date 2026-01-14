@@ -895,17 +895,265 @@ elif mode == "📊 批量组合分析":
 
 # === 辅助函数：整合的回测和因子分析 ===
 
+def _show_factor_analysis_integrated(symbol, df_f):
+    """整合的因子分析函数 - 优化版"""
+    try:
+        from src.factor_analysis.ic_analysis import ICAnalyzer
+        from src.factor_analysis.regime_detector import RegimeDetector
+        from src.strategies.kline_factor import KLineFactorCalculator
+        
+        # 使用K线学习因子作为因子值（更准确）
+        # 需要传入data_loader以支持Triple Barrier计算
+        try:
+            kline_factor_calc = KLineFactorCalculator(data_loader=eng["loader"])
+        except:
+            kline_factor_calc = KLineFactorCalculator()
+        
+        # 计算历史因子值（使用Top10匹配的胜率）
+        factor_values_list = []
+        forward_returns_list = []
+        dates_list = []
+        
+        # 遍历历史数据，计算每个时间点的因子值
+        for i in range(20, len(df_f) - 5):
+            try:
+                # 获取当前时间点的K线图
+                current_data = df_f.iloc[i-20:i]
+                if len(current_data) < 20:
+                    continue
+                
+                # 生成临时K线图用于匹配
+                temp_img = os.path.join(PROJECT_ROOT, "data", f"temp_factor_{i}.png")
+                mc = mpf.make_marketcolors(up='red', down='green', inherit=True)
+                s = mpf.make_mpf_style(marketcolors=mc, gridstyle='')
+                mpf.plot(current_data, type='candle', style=s, savefig=dict(fname=temp_img, dpi=50), 
+                        figsize=(3, 3), axisoff=True)
+                
+                # 搜索相似模式
+                matches = eng["vision"].search_similar_patterns(temp_img, top_k=10)
+                
+                if matches and len(matches) > 0:
+                    # 计算混合胜率作为因子值
+                    try:
+                        # 获取日期字符串
+                        try:
+                            if hasattr(df_f.index[i], 'strftime'):
+                                date_str = df_f.index[i].strftime('%Y%m%d')
+                            elif isinstance(df_f.index[i], pd.Timestamp):
+                                date_str = df_f.index[i].strftime('%Y%m%d')
+                            else:
+                                date_str = str(df_f.index[i]).replace('-', '').replace(' ', '')[:8]
+                        except:
+                            date_str = str(i)  # 如果日期转换失败，使用索引
+                        
+                        factor_result = kline_factor_calc.calculate_hybrid_win_rate(
+                            matches, 
+                            query_symbol=symbol, 
+                            query_date=date_str
+                        )
+                        
+                        # 确保返回的是字典
+                        if not isinstance(factor_result, dict):
+                            factor_result = {'hybrid_win_rate': 50.0}
+                        
+                        # 确保返回的是字典且包含hybrid_win_rate
+                        if isinstance(factor_result, dict) and 'hybrid_win_rate' in factor_result:
+                            factor_value = factor_result.get('hybrid_win_rate', 50.0) / 100.0  # 归一化到0-1
+                        else:
+                            factor_value = 0.5  # 默认值
+                    except Exception as e:
+                        factor_value = 0.5  # 默认值
+                        continue
+                    
+                    # 未来5日收益率
+                    future_return = (df_f.iloc[i+5]['Close'] - df_f.iloc[i]['Close']) / df_f.iloc[i]['Close']
+                    
+                    factor_values_list.append(factor_value)
+                    forward_returns_list.append(future_return)
+                    dates_list.append(df_f.index[i])
+                
+                # 清理临时文件
+                if os.path.exists(temp_img):
+                    os.remove(temp_img)
+                    
+            except Exception as e:
+                continue
+        
+        if len(factor_values_list) > 20:
+            # 转换为Series
+            factor_values = pd.Series(factor_values_list, index=dates_list)
+            forward_returns = pd.Series(forward_returns_list, index=dates_list)
+            
+            # IC分析
+            ic_analyzer = ICAnalyzer(factor_values, forward_returns)
+            rolling_ic = ic_analyzer.calculate_rolling_ic(window=min(20, len(factor_values)//2))
+            
+            # 绘制IC曲线
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=rolling_ic.index,
+                y=rolling_ic.values,
+                mode='lines',
+                name='Rolling IC',
+                line=dict(color='blue', width=2)
+            ))
+            fig.add_hline(y=0.05, line_dash="dash", line_color="green", 
+                         annotation_text="IC阈值(0.05)")
+            fig.add_hline(y=-0.05, line_dash="dash", line_color="red")
+            fig.update_layout(title="IC曲线分析", height=300)
+            st.plotly_chart(fig, config={"displayModeBar": False}, use_container_width=True)
+            
+            # 显示IC统计
+            ic_stats = ic_analyzer.get_ic_statistics(rolling_ic)
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("平均IC", f"{ic_stats['mean_ic']:.4f}", 
+                         delta="有效" if ic_stats['mean_ic'] > 0.05 else "无效")
+            with col2:
+                st.metric("IC标准差", f"{ic_stats['std_ic']:.4f}")
+            with col3:
+                st.metric("ICIR", f"{ic_stats['ic_ir']:.2f}", 
+                         delta="优秀" if abs(ic_stats['ic_ir']) > 1.0 else "一般")
+            with col4:
+                st.metric("正IC比例", f"{ic_stats['positive_ic_ratio']*100:.1f}%",
+                         delta="良好" if ic_stats['positive_ic_ratio'] > 0.6 else "一般")
+            
+            # Regime识别图
+            st.subheader("市场Regime识别")
+            regime_detector = RegimeDetector(df_f['Close'])
+            regimes = regime_detector.detect_regime()
+            regime_counts = regimes.value_counts()
+            
+            colors_map = {'Bull': 'green', 'Bear': 'red', 'Oscillating': 'yellow'}
+            fig_regime = go.Figure(data=[go.Bar(
+                x=regime_counts.index,
+                y=regime_counts.values,
+                marker_color=[colors_map.get(r, 'gray') for r in regime_counts.index]
+            )])
+            fig_regime.update_layout(title="市场Regime分布", height=300)
+            st.plotly_chart(fig_regime, config={"displayModeBar": False}, use_container_width=True)
+            
+            # 因子衰减分析
+            st.subheader("因子衰减分析")
+            decay_window = min(60, len(rolling_ic))
+            recent_ic = rolling_ic.tail(decay_window).mean()
+            earlier_ic = rolling_ic.head(decay_window).mean() if len(rolling_ic) > decay_window else recent_ic
+            decay_rate = (recent_ic - earlier_ic) / abs(earlier_ic) * 100 if earlier_ic != 0 else 0
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("早期IC均值", f"{earlier_ic:.4f}")
+            with col2:
+                st.metric("近期IC均值", f"{recent_ic:.4f}", 
+                         delta=f"{decay_rate:.1f}%", 
+                         delta_color="inverse" if decay_rate < 0 else "normal")
+            
+            # 因子失效多维度检测
+            try:
+                from src.factor_analysis.factor_invalidation import FactorInvalidationDetector
+                st.subheader("因子失效检测")
+                invalidation_detector = FactorInvalidationDetector()
+                invalidation_result = invalidation_detector.detect_invalidation(
+                    factor_values=factor_values,
+                    returns=forward_returns
+                )
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("失效得分", f"{invalidation_result['invalidation_score']:.2f}",
+                             delta="失效" if invalidation_result['is_invalidated'] else "有效",
+                             delta_color="inverse" if invalidation_result['is_invalidated'] else "normal")
+                with col2:
+                    st.metric("IC状态", "失效" if invalidation_result['ic_invalidation']['is_invalidated'] else "正常")
+                with col3:
+                    st.metric("衰减状态", "失效" if invalidation_result['decay_invalidation']['is_invalidated'] else "正常")
+                
+                if invalidation_result['is_invalidated']:
+                    st.warning("⚠️ 因子可能已失效，建议降低权重或暂停使用")
+            except Exception as e:
+                st.info(f"因子失效检测功能暂不可用: {e}")
+            
+        else:
+            st.warning("数据不足，无法进行因子分析。需要至少20个有效数据点。")
+    except ImportError as e:
+        st.error(f"模块导入失败: {e}")
+        st.info("提示：请确保因子分析模块已正确安装")
+    except Exception as e:
+        st.error(f"因子分析失败: {e}")
+        import traceback
+        with st.expander("查看详细错误信息"):
+            st.code(traceback.format_exc())
+
 def _run_backtest_integrated(symbol, bt_start, bt_end, bt_cap, bt_ma, bt_stop, bt_vision, 
                              bt_validation, wf_train_months, wf_test_months):
     """整合的回测函数"""
+    # #region agent log
+    import json
+    log_path = "/Users/bytedance/PycharmProjects/.cursor/debug.log"
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "sessionId": "debug-session",
+                "runId": "run1",
+                "hypothesisId": "A",
+                "location": "web/app.py:898",
+                "message": "Function entry",
+                "data": {
+                    "symbol": symbol,
+                    "bt_validation": bt_validation,
+                    "wf_train_months": wf_train_months,
+                    "wf_test_months": wf_test_months
+                },
+                "timestamp": int(pd.Timestamp.now().timestamp() * 1000)
+            }) + "\n")
+    except: pass
+    # #endregion
+    
     use_walk_forward = bt_validation == "Walk-Forward验证（严格）"
     
     with st.spinner("回测中..." if not use_walk_forward else f"Walk-Forward验证中（训练期{wf_train_months}月，测试期{wf_test_months}月）..."):
         df_bt = eng["loader"].get_stock_data(symbol, start_date=bt_start.strftime("%Y%m%d"))
+        
+        # #region agent log
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "sessionId": "debug-session",
+                    "runId": "run1",
+                    "hypothesisId": "B",
+                    "location": "web/app.py:904",
+                    "message": "Data loaded",
+                    "data": {
+                        "df_empty": df_bt.empty,
+                        "df_shape": list(df_bt.shape) if not df_bt.empty else None
+                    },
+                    "timestamp": int(pd.Timestamp.now().timestamp() * 1000)
+                }) + "\n")
+        except: pass
+        # #endregion
+        
         if not df_bt.empty:
             df_bt.index = pd.to_datetime(df_bt.index)
             mask = (df_bt.index >= pd.to_datetime(bt_start)) & (df_bt.index <= pd.to_datetime(bt_end))
             df_bt = df_bt.loc[mask].copy()
+            
+            # #region agent log
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({
+                        "sessionId": "debug-session",
+                        "runId": "run1",
+                        "hypothesisId": "C",
+                        "location": "web/app.py:909",
+                        "message": "After filtering",
+                        "data": {
+                            "df_shape": list(df_bt.shape),
+                            "use_walk_forward": use_walk_forward
+                        },
+                        "timestamp": int(pd.Timestamp.now().timestamp() * 1000)
+                    }) + "\n")
+            except: pass
+            # #endregion
             
             if use_walk_forward:
                 # 真正实现Walk-Forward验证
@@ -916,6 +1164,25 @@ def _run_backtest_integrated(symbol, bt_start, bt_end, bt_cap, bt_ma, bt_stop, b
                 test_days = wf_test_months * 21
                 step_days = wf_test_months * 21  # 每次滚动一个测试期
                 
+                # #region agent log
+                try:
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "sessionId": "debug-session",
+                            "runId": "run1",
+                            "hypothesisId": "D",
+                            "location": "web/app.py:920",
+                            "message": "Before WalkForwardValidator",
+                            "data": {
+                                "train_days": train_days,
+                                "test_days": test_days,
+                                "step_days": step_days
+                            },
+                            "timestamp": int(pd.Timestamp.now().timestamp() * 1000)
+                        }) + "\n")
+                except: pass
+                # #endregion
+                
                 validator = WalkForwardValidator(
                     train_period=train_days,
                     test_period=test_days,
@@ -925,7 +1192,58 @@ def _run_backtest_integrated(symbol, bt_start, bt_end, bt_cap, bt_ma, bt_stop, b
                 all_results = []
                 fold_count = 0
                 
+                # #region agent log
+                try:
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "sessionId": "debug-session",
+                            "runId": "run1",
+                            "hypothesisId": "E",
+                            "location": "web/app.py:928",
+                            "message": "Before split iteration",
+                            "data": {},
+                            "timestamp": int(pd.Timestamp.now().timestamp() * 1000)
+                        }) + "\n")
+                except: pass
+                # #endregion
+                
                 for split in validator.split(df_bt):
+                    # #region agent log
+                    try:
+                        with open(log_path, "a", encoding="utf-8") as f:
+                            f.write(json.dumps({
+                                "sessionId": "debug-session",
+                                "runId": "run1",
+                                "hypothesisId": "F",
+                                "location": "web/app.py:929",
+                                "message": "Split object attributes",
+                                "data": {
+                                    "has_train_start": hasattr(split, "train_start"),
+                                    "has_train_end": hasattr(split, "train_end"),
+                                    "has_test_start": hasattr(split, "test_start"),
+                                    "has_test_end": hasattr(split, "test_end"),
+                                    "has_train_indices": hasattr(split, "train_indices"),
+                                    "has_test_indices": hasattr(split, "test_indices"),
+                                    "split_type": str(type(split)),
+                                    "split_dir": dir(split)[:10] if hasattr(split, "__dict__") else None
+                                },
+                                "timestamp": int(pd.Timestamp.now().timestamp() * 1000)
+                            }) + "\n")
+                    except Exception as e:
+                        try:
+                            with open(log_path, "a", encoding="utf-8") as f:
+                                f.write(json.dumps({
+                                    "sessionId": "debug-session",
+                                    "runId": "run1",
+                                    "hypothesisId": "F",
+                                    "location": "web/app.py:929",
+                                    "message": "Error checking split attributes",
+                                    "data": {"error": str(e)},
+                                    "timestamp": int(pd.Timestamp.now().timestamp() * 1000)
+                                }) + "\n")
+                        except: pass
+                    # #endregion
+                    
                     fold_count += 1
                     train_data = df_bt.iloc[split.train_indices]
                     test_data = df_bt.iloc[split.test_indices]
@@ -945,6 +1263,9 @@ def _run_backtest_integrated(symbol, bt_start, bt_end, bt_cap, bt_ma, bt_stop, b
                     exp12 = test_data['Close'].ewm(span=12, adjust=False).mean()
                     exp26 = test_data['Close'].ewm(span=26, adjust=False).mean()
                     test_data['MACD'] = (exp12 - exp26) * 2
+                    # 确保有Volume列（如果没有则使用默认值）
+                    if 'Volume' not in test_data.columns:
+                        test_data['Volume'] = test_data['Close'] * 1000000  # 默认成交量
                     test_data = test_data.dropna()
                     
                     # 加载AI胜率数据（使用混合胜率，如果可用）
@@ -960,9 +1281,15 @@ def _run_backtest_integrated(symbol, bt_start, bt_end, bt_cap, bt_ma, bt_stop, b
                             pass
                     
                     # 回测逻辑（与之前相同，但只在测试集上运行）
+                    # 集成Transaction Cost模型和Turnover约束
+                    from src.strategies.transaction_cost import AdvancedTransactionCost
+                    transaction_cost_calc = AdvancedTransactionCost()
+                    
                     cash, shares, equity = bt_cap, 0, []
                     trade_log = []
                     entry_price = 0.0
+                    daily_turnover = []  # 记录每日换手率
+                    max_daily_turnover = 0.20  # 最大单日换手率20%
                     
                     for _, row in test_data.iterrows():
                         p = row['Close']
@@ -971,6 +1298,11 @@ def _run_backtest_integrated(symbol, bt_start, bt_end, bt_cap, bt_ma, bt_stop, b
                         macd = row.get('MACD', 0)
                         date_str = row.name.strftime("%Y%m%d")
                         ai_win = vision_map.get((symbol, date_str), 50.0)
+                        # 安全获取Volume，如果不存在则使用默认值
+                        try:
+                            volume = float(row.get('Volume', row.get('volume', test_data['Close'].mean() * 1000000)))
+                        except:
+                            volume = test_data['Close'].mean() * 1000000 if len(test_data) > 0 else 1000000
                         
                         target_pos = 0.0
                         if p > ma60:
@@ -989,35 +1321,131 @@ def _run_backtest_integrated(symbol, bt_start, bt_end, bt_cap, bt_ma, bt_stop, b
                         target_shares = int(target_val / p) if p > 0 else 0
                         diff = target_shares - shares
                         
+                        # Turnover约束：计算当日换手率
+                        if total_assets > 0:
+                            daily_turnover_pct = abs(diff * p) / total_assets
+                            if daily_turnover_pct > max_daily_turnover:
+                                # 限制换手率
+                                max_trade_value = total_assets * max_daily_turnover
+                                if diff > 0:
+                                    diff = int(max_trade_value / p)
+                                else:
+                                    diff = -int(max_trade_value / p)
+                        
                         if abs(diff * p) > total_assets * 0.1:
+                            trade_value = abs(diff * p)
+                            
+                            # 计算Transaction Cost（添加错误处理）
+                            try:
+                                volatility = test_data['Close'].pct_change().std() if len(test_data) > 1 else 0.02
+                                if pd.isna(volatility) or volatility <= 0:
+                                    volatility = 0.02
+                                cost_result = transaction_cost_calc.calculate_cost(
+                                    trade_size=trade_value,
+                                    price=p,
+                                    volume=max(volume, 1),  # 确保volume > 0
+                                    volatility=volatility,
+                                    is_buy=(diff > 0)
+                                )
+                                total_cost = cost_result.get('total_cost', trade_value * 0.001)  # 默认0.1%成本
+                            except Exception as e:
+                                # 如果Transaction Cost计算失败，使用简单成本模型
+                                total_cost = trade_value * 0.001  # 默认0.1%成本
+                            
                             if diff > 0:
-                                cost = diff * p * 1.0003
+                                cost = diff * p + total_cost
                                 if cash >= cost:
                                     cash -= cost
                                     shares += diff
                                     if entry_price == 0:
                                         entry_price = p
+                                    trade_log.append({
+                                        'date': date_str, 
+                                        'action': 'BUY', 
+                                        'price': p,
+                                        'shares': diff,
+                                        'cost': total_cost
+                                    })
                             elif diff < 0:
                                 pnl = (p - entry_price) / entry_price if entry_price > 0 and shares > 0 else 0
                                 if pnl < -bt_stop / 100:
                                     diff = -shares
-                                revenue = abs(diff) * p * 0.9997
+                                revenue = abs(diff) * p - total_cost
                                 cash += revenue
                                 shares += diff
                                 if shares == 0:
                                     entry_price = 0
+                                trade_log.append({
+                                    'date': date_str, 
+                                    'action': 'SELL', 
+                                    'price': p,
+                                    'shares': abs(diff),
+                                    'cost': total_cost
+                                })
                         
                         equity.append(cash + shares * p)
+                        daily_turnover.append(abs(diff * p) / total_assets if total_assets > 0 else 0)
                     
                     if equity:
                         ret = (equity[-1] - bt_cap) / bt_cap * 100
                         bench_ret = (test_data['Close'].iloc[-1] - test_data['Close'].iloc[0]) / test_data['Close'].iloc[0] * 100
+                        
+                        # #region agent log
+                        try:
+                            train_start_str = split.train_start.strftime('%Y-%m-%d') if hasattr(split.train_start, 'strftime') else str(split.train_start)
+                            train_end_str = split.train_end.strftime('%Y-%m-%d') if hasattr(split.train_end, 'strftime') else str(split.train_end)
+                            test_start_str = split.test_start.strftime('%Y-%m-%d') if hasattr(split.test_start, 'strftime') else str(split.test_start)
+                            test_end_str = split.test_end.strftime('%Y-%m-%d') if hasattr(split.test_end, 'strftime') else str(split.test_end)
+                            
+                            with open(log_path, "a", encoding="utf-8") as f:
+                                f.write(json.dumps({
+                                    "sessionId": "debug-session",
+                                    "runId": "run1",
+                                    "hypothesisId": "G",
+                                    "location": "web/app.py:1015",
+                                    "message": "Before appending result",
+                                    "data": {
+                                        "train_start_type": str(type(split.train_start)),
+                                        "train_start_str": train_start_str,
+                                        "ret": ret,
+                                        "bench_ret": bench_ret
+                                    },
+                                    "timestamp": int(pd.Timestamp.now().timestamp() * 1000)
+                                }) + "\n")
+                        except Exception as e:
+                            try:
+                                with open(log_path, "a", encoding="utf-8") as f:
+                                    f.write(json.dumps({
+                                        "sessionId": "debug-session",
+                                        "runId": "run1",
+                                        "hypothesisId": "G",
+                                        "location": "web/app.py:1015",
+                                        "message": "Error formatting dates",
+                                        "data": {"error": str(e)},
+                                        "timestamp": int(pd.Timestamp.now().timestamp() * 1000)
+                                    }) + "\n")
+                            except: pass
+                        # #endregion
+                        
+                        # 安全地格式化日期
+                        try:
+                            train_start_str = split.train_start.strftime('%Y-%m-%d') if hasattr(split.train_start, 'strftime') else str(split.train_start)
+                            train_end_str = split.train_end.strftime('%Y-%m-%d') if hasattr(split.train_end, 'strftime') else str(split.train_end)
+                            test_start_str = split.test_start.strftime('%Y-%m-%d') if hasattr(split.test_start, 'strftime') else str(split.test_start)
+                            test_end_str = split.test_end.strftime('%Y-%m-%d') if hasattr(split.test_end, 'strftime') else str(split.test_end)
+                        except Exception as e:
+                            # 如果日期格式化失败，使用索引位置
+                            train_start_str = f"Fold{fold_count}_TrainStart"
+                            train_end_str = f"Fold{fold_count}_TrainEnd"
+                            test_start_str = f"Fold{fold_count}_TestStart"
+                            test_end_str = f"Fold{fold_count}_TestEnd"
+                        
                         all_results.append({
                             'fold': fold_count,
-                            'train_start': split.train_start.strftime('%Y-%m-%d'),
-                            'train_end': split.train_end.strftime('%Y-%m-%d'),
-                            'test_start': split.test_start.strftime('%Y-%m-%d'),
-                            'test_end': split.test_end.strftime('%Y-%m-%d'),
+                            'train_start': train_start_str,
+                            'train_end': train_end_str,
+                            'test_start': test_start_str,
+                            'test_end': test_end_str,
                             'return': ret,
                             'benchmark': bench_ret,
                             'alpha': ret - bench_ret,
@@ -1091,6 +1519,9 @@ def _run_backtest_integrated(symbol, bt_start, bt_end, bt_cap, bt_ma, bt_stop, b
                     exp12 = df_bt['Close'].ewm(span=12, adjust=False).mean()
                     exp26 = df_bt['Close'].ewm(span=26, adjust=False).mean()
                     df_bt['MACD'] = (exp12 - exp26) * 2
+                    # 确保有Volume列
+                    if 'Volume' not in df_bt.columns:
+                        df_bt['Volume'] = df_bt['Close'] * 1000000  # 默认成交量
                     df_bt = df_bt.dropna()
                     
                     # 加载AI胜率数据（使用混合胜率，如果可用）
@@ -1105,9 +1536,14 @@ def _run_backtest_integrated(symbol, bt_start, bt_end, bt_cap, bt_ma, bt_stop, b
                         except:
                             pass
                     
+                    # 集成Transaction Cost模型和Turnover约束
+                    from src.strategies.transaction_cost import AdvancedTransactionCost
+                    transaction_cost_calc = AdvancedTransactionCost()
+                    
                     cash, shares, equity = bt_cap, 0, []
                     trade_log = []
                     entry_price = 0.0
+                    max_daily_turnover = 0.20  # 最大单日换手率20%
                     
                     for _, row in df_bt.iterrows():
                         p = row['Close']
@@ -1116,6 +1552,11 @@ def _run_backtest_integrated(symbol, bt_start, bt_end, bt_cap, bt_ma, bt_stop, b
                         macd = row.get('MACD', 0)
                         date_str = row.name.strftime("%Y%m%d")
                         ai_win = vision_map.get((symbol, date_str), 50.0)
+                        # 安全获取Volume
+                        try:
+                            volume = float(row.get('Volume', row.get('volume', df_bt['Close'].mean() * 1000000)))
+                        except:
+                            volume = df_bt['Close'].mean() * 1000000 if len(df_bt) > 0 else 1000000
                         
                         target_pos = 0.0
                         if p > ma60:
@@ -1134,25 +1575,64 @@ def _run_backtest_integrated(symbol, bt_start, bt_end, bt_cap, bt_ma, bt_stop, b
                         target_shares = int(target_val / p) if p > 0 else 0
                         diff = target_shares - shares
                         
+                        # Turnover约束
+                        if total_assets > 0:
+                            daily_turnover_pct = abs(diff * p) / total_assets
+                            if daily_turnover_pct > max_daily_turnover:
+                                max_trade_value = total_assets * max_daily_turnover
+                                if diff > 0:
+                                    diff = int(max_trade_value / p)
+                                else:
+                                    diff = -int(max_trade_value / p)
+                        
                         if abs(diff * p) > total_assets * 0.1:
+                            trade_value = abs(diff * p)
+                            
+                            # 计算Transaction Cost（添加错误处理）
+                            try:
+                                volatility = df_bt['Close'].pct_change().std() if len(df_bt) > 1 else 0.02
+                                if pd.isna(volatility) or volatility <= 0:
+                                    volatility = 0.02
+                                cost_result = transaction_cost_calc.calculate_cost(
+                                    trade_size=trade_value,
+                                    price=p,
+                                    volume=max(volume, 1),  # 确保volume > 0
+                                    volatility=volatility,
+                                    is_buy=(diff > 0)
+                                )
+                                total_cost = cost_result.get('total_cost', trade_value * 0.001)  # 默认0.1%成本
+                            except Exception as e:
+                                # 如果Transaction Cost计算失败，使用简单成本模型
+                                total_cost = trade_value * 0.001  # 默认0.1%成本
+                            
                             if diff > 0:
-                                cost = diff * p * 1.0003
+                                cost = diff * p + total_cost
                                 if cash >= cost:
                                     cash -= cost
                                     shares += diff
                                     if entry_price == 0:
                                         entry_price = p
-                                    trade_log.append({'date': date_str, 'action': 'BUY', 'price': p})
+                                    trade_log.append({
+                                        'date': date_str, 
+                                        'action': 'BUY', 
+                                        'price': p,
+                                        'cost': total_cost
+                                    })
                             elif diff < 0:
                                 pnl = (p - entry_price) / entry_price if entry_price > 0 and shares > 0 else 0
                                 if pnl < -bt_stop / 100:
                                     diff = -shares
-                                revenue = abs(diff) * p * 0.9997
+                                revenue = abs(diff) * p - total_cost
                                 cash += revenue
                                 shares += diff
                                 if shares == 0:
                                     entry_price = 0
-                                trade_log.append({'date': date_str, 'action': 'SELL', 'price': p})
+                                trade_log.append({
+                                    'date': date_str, 
+                                    'action': 'SELL', 
+                                    'price': p,
+                                    'cost': total_cost
+                                })
                         
                         equity.append(cash + shares * p)
                     
@@ -1189,136 +1669,3 @@ def _run_backtest_integrated(symbol, bt_start, bt_end, bt_cap, bt_ma, bt_stop, b
                     st.error("数据不足")
         else:
             st.error("数据获取失败")
-
-def _show_factor_analysis_integrated(symbol, df_f):
-    """整合的因子分析函数 - 优化版"""
-    try:
-        from src.factor_analysis.ic_analysis import ICAnalyzer
-        from src.factor_analysis.regime_detector import RegimeDetector
-        from src.strategies.kline_factor import KLineFactorCalculator
-        
-        # 使用K线学习因子作为因子值（更准确）
-        kline_factor_calc = KLineFactorCalculator()
-        
-        # 计算历史因子值（使用Top10匹配的胜率）
-        factor_values_list = []
-        forward_returns_list = []
-        dates_list = []
-        
-        # 遍历历史数据，计算每个时间点的因子值
-        for i in range(20, len(df_f) - 5):
-            try:
-                # 获取当前时间点的K线图
-                current_data = df_f.iloc[i-20:i]
-                if len(current_data) < 20:
-                    continue
-                
-                # 生成临时K线图用于匹配
-                temp_img = os.path.join(PROJECT_ROOT, "data", f"temp_factor_{i}.png")
-                mc = mpf.make_marketcolors(up='red', down='green', inherit=True)
-                s = mpf.make_mpf_style(marketcolors=mc, gridstyle='')
-                mpf.plot(current_data, type='candle', style=s, savefig=dict(fname=temp_img, dpi=50), 
-                        figsize=(3, 3), axisoff=True)
-                
-                # 搜索相似模式
-                matches = eng["vision"].search_similar_patterns(temp_img, top_k=10)
-                
-                if matches:
-                    # 计算混合胜率作为因子值
-                    factor_result = kline_factor_calc.calculate_hybrid_win_rate(matches, symbol, 
-                                                                                df_f.index[i].strftime('%Y%m%d'))
-                    factor_value = factor_result.get('hybrid_win_rate', 50.0) / 100.0  # 归一化到0-1
-                    
-                    # 未来5日收益率
-                    future_return = (df_f.iloc[i+5]['Close'] - df_f.iloc[i]['Close']) / df_f.iloc[i]['Close']
-                    
-                    factor_values_list.append(factor_value)
-                    forward_returns_list.append(future_return)
-                    dates_list.append(df_f.index[i])
-                
-                # 清理临时文件
-                if os.path.exists(temp_img):
-                    os.remove(temp_img)
-                    
-            except Exception as e:
-                continue
-        
-        if len(factor_values_list) > 20:
-            # 转换为Series
-            factor_values = pd.Series(factor_values_list, index=dates_list)
-            forward_returns = pd.Series(forward_returns_list, index=dates_list)
-            
-            # IC分析
-            ic_analyzer = ICAnalyzer(factor_values, forward_returns)
-            rolling_ic = ic_analyzer.calculate_rolling_ic(window=min(20, len(factor_values)//2))
-            
-            # 绘制IC曲线
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=rolling_ic.index,
-                y=rolling_ic.values,
-                mode='lines',
-                name='Rolling IC',
-                line=dict(color='blue', width=2)
-            ))
-            fig.add_hline(y=0.05, line_dash="dash", line_color="green", 
-                         annotation_text="IC阈值(0.05)")
-            fig.add_hline(y=-0.05, line_dash="dash", line_color="red")
-            fig.update_layout(title="IC曲线分析", height=300)
-            st.plotly_chart(fig, config={"displayModeBar": False}, use_container_width=True)
-            
-            # 显示IC统计
-            ic_stats = ic_analyzer.get_ic_statistics(rolling_ic)
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("平均IC", f"{ic_stats['mean_ic']:.4f}", 
-                         delta="有效" if ic_stats['mean_ic'] > 0.05 else "无效")
-            with col2:
-                st.metric("IC标准差", f"{ic_stats['std_ic']:.4f}")
-            with col3:
-                st.metric("ICIR", f"{ic_stats['ic_ir']:.2f}", 
-                         delta="优秀" if abs(ic_stats['ic_ir']) > 1.0 else "一般")
-            with col4:
-                st.metric("正IC比例", f"{ic_stats['positive_ic_ratio']*100:.1f}%",
-                         delta="良好" if ic_stats['positive_ic_ratio'] > 0.6 else "一般")
-            
-            # Regime识别图 - 专业风格
-            st.subheader("市场Regime识别")
-            regime_detector = RegimeDetector(df_f['Close'])
-            regimes = regime_detector.detect_regime()
-            regime_counts = regimes.value_counts()
-            
-            colors_map = {'Bull': 'green', 'Bear': 'red', 'Oscillating': 'yellow'}
-            fig_regime = go.Figure(data=[go.Bar(
-                x=regime_counts.index,
-                y=regime_counts.values,
-                marker_color=[colors_map.get(r, 'gray') for r in regime_counts.index]
-            )])
-            fig_regime.update_layout(title="市场Regime分布", height=300)
-            st.plotly_chart(fig_regime, config={"displayModeBar": False}, use_container_width=True)
-            
-            # 因子衰减分析
-            st.subheader("因子衰减分析")
-            decay_window = min(60, len(rolling_ic))
-            recent_ic = rolling_ic.tail(decay_window).mean()
-            earlier_ic = rolling_ic.head(decay_window).mean() if len(rolling_ic) > decay_window else recent_ic
-            decay_rate = (recent_ic - earlier_ic) / abs(earlier_ic) * 100 if earlier_ic != 0 else 0
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("早期IC均值", f"{earlier_ic:.4f}")
-            with col2:
-                st.metric("近期IC均值", f"{recent_ic:.4f}", 
-                         delta=f"{decay_rate:.1f}%", 
-                         delta_color="inverse" if decay_rate < 0 else "normal")
-            
-        else:
-            st.warning("数据不足，无法进行因子分析。需要至少20个有效数据点。")
-    except ImportError as e:
-        st.error(f"模块导入失败: {e}")
-        st.info("提示：请确保因子分析模块已正确安装")
-    except Exception as e:
-        st.error(f"因子分析失败: {e}")
-        import traceback
-        with st.expander("查看详细错误信息"):
-            st.code(traceback.format_exc())
