@@ -52,16 +52,202 @@ def _code_version_key() -> str:
     return "|".join(parts)
 
 # ================= 页面配置 =================
-st.set_page_config(page_title="VisionQuant Pro", layout="wide", page_icon="🦄")
+st.set_page_config(page_title="VisionQuant Pro", layout="wide", page_icon="🦄", initial_sidebar_state="expanded")
 
+# ================= Apple/Google AI Studio 风格 UI =================
 st.markdown("""
     <style>
-    .main { background-color: #f8f9fa; }
-    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; border: 1px solid #e6e9ef; }
-    /* 核心决策框样式 */
-    .agent-box { border-left: 5px solid #ff4b4b; padding: 20px; background-color: #fff1f1; border-radius: 5px; margin-bottom: 20px; }
-    /* 聊天气泡 */
-    .stChatMessage { background-color: #ffffff; border-radius: 12px; padding: 12px; margin-bottom: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    /* Apple/Google AI Studio 风格 - 简洁现代 */
+    
+    /* 全局样式 */
+    .main {
+        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
+    }
+    
+    /* 侧边栏样式 - Apple风格 */
+    [data-testid="stSidebar"] {
+        background: rgba(255, 255, 255, 0.95);
+        backdrop-filter: blur(20px);
+        border-right: 1px solid rgba(0, 0, 0, 0.08);
+        box-shadow: 2px 0 20px rgba(0, 0, 0, 0.05);
+    }
+    
+    /* 主内容区 - Google AI Studio风格 */
+    .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+        max-width: 1400px;
+    }
+    
+    /* 卡片样式 - Apple风格 */
+    .metric-card {
+        background: rgba(255, 255, 255, 0.9);
+        backdrop-filter: blur(10px);
+        border-radius: 16px;
+        padding: 24px;
+        margin: 12px 0;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+        border: 1px solid rgba(0, 0, 0, 0.06);
+        transition: all 0.3s ease;
+    }
+    
+    .metric-card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 8px 30px rgba(0, 0, 0, 0.12);
+    }
+    
+    /* Metric组件 - Google AI Studio风格 */
+    [data-testid="stMetric"] {
+        background: rgba(255, 255, 255, 0.95);
+        backdrop-filter: blur(10px);
+        padding: 20px;
+        border-radius: 12px;
+        border: 1px solid rgba(0, 0, 0, 0.08);
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+        transition: all 0.2s ease;
+    }
+    
+    [data-testid="stMetric"]:hover {
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+    }
+    
+    /* 按钮样式 - Apple风格 */
+    .stButton > button {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        border: none;
+        border-radius: 12px;
+        padding: 12px 24px;
+        font-weight: 600;
+        font-size: 14px;
+        transition: all 0.3s ease;
+        box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
+    }
+    
+    .stButton > button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
+    }
+    
+    /* 输入框样式 - Google AI Studio风格 */
+    .stTextInput > div > div > input {
+        border-radius: 12px;
+        border: 2px solid rgba(0, 0, 0, 0.1);
+        padding: 12px 16px;
+        font-size: 15px;
+        transition: all 0.2s ease;
+    }
+    
+    .stTextInput > div > div > input:focus {
+        border-color: #667eea;
+        box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+    }
+    
+    /* 标题样式 - Apple风格 */
+    h1 {
+        font-size: 42px;
+        font-weight: 700;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 8px;
+    }
+    
+    h2 {
+        font-size: 28px;
+        font-weight: 600;
+        color: #1d1d1f;
+        margin-top: 32px;
+        margin-bottom: 16px;
+    }
+    
+    h3 {
+        font-size: 20px;
+        font-weight: 600;
+        color: #1d1d1f;
+        margin-top: 24px;
+        margin-bottom: 12px;
+    }
+    
+    /* 核心决策框样式 - Google AI Studio风格 */
+    .agent-box {
+        background: linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%);
+        border-left: 4px solid #667eea;
+        padding: 24px;
+        border-radius: 16px;
+        margin: 24px 0;
+        backdrop-filter: blur(10px);
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+    }
+    
+    /* 聊天气泡 - Apple Messages风格 */
+    [data-testid="stChatMessage"] {
+        background: rgba(255, 255, 255, 0.95);
+        border-radius: 18px;
+        padding: 16px 20px;
+        margin-bottom: 12px;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08);
+        border: 1px solid rgba(0, 0, 0, 0.06);
+    }
+    
+    /* 分割线 - 更优雅 */
+    hr {
+        border: none;
+        height: 1px;
+        background: linear-gradient(90deg, transparent, rgba(0, 0, 0, 0.1), transparent);
+        margin: 32px 0;
+    }
+    
+    /* 侧边栏标题 */
+    [data-testid="stSidebar"] h1 {
+        font-size: 32px;
+        font-weight: 700;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 16px;
+    }
+    
+    /* 卡片容器 */
+    .card-container {
+        background: rgba(255, 255, 255, 0.95);
+        backdrop-filter: blur(10px);
+        border-radius: 16px;
+        padding: 24px;
+        margin: 16px 0;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+        border: 1px solid rgba(0, 0, 0, 0.06);
+    }
+    
+    /* 图表容器 */
+    .plotly-container {
+        background: rgba(255, 255, 255, 0.95);
+        border-radius: 16px;
+        padding: 16px;
+        margin: 16px 0;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+    }
+    
+    /* 滚动条样式 - 更现代 */
+    ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+    }
+    
+    ::-webkit-scrollbar-track {
+        background: rgba(0, 0, 0, 0.05);
+        border-radius: 4px;
+    }
+    
+    ::-webkit-scrollbar-thumb {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        border-radius: 4px;
+    }
+    
+    ::-webkit-scrollbar-thumb:hover {
+        background: linear-gradient(135deg, #5568d3 0%, #653a8f 100%);
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -549,11 +735,10 @@ if mode == "🔍 单只股票分析":
         # === 整合功能：回测和因子分析 ===
         # 检查是否显示回测
         if show_backtest and "res" in st.session_state:
-            st.divider()
+            st.markdown('<div class="card-container">', unsafe_allow_html=True)
             st.subheader("🧪 策略模拟回测")
             
             # 回测参数（从侧边栏重新获取，确保使用最新值）
-            # 注意：由于Streamlit的渲染机制，需要在按钮点击时重新读取侧边栏的值
             bt_start_val = st.session_state.get("bt_start", datetime(2022, 1, 1))
             bt_end_val = st.session_state.get("bt_end", datetime.now())
             bt_cap_val = st.session_state.get("bt_cap", 100000)
@@ -564,16 +749,18 @@ if mode == "🔍 单只股票分析":
             wf_train_months_val = st.session_state.get("wf_train_months", 24)
             wf_test_months_val = st.session_state.get("wf_test_months", 6)
             
-            if st.button("开始回测", key="backtest_btn"):
+            if st.button("🚀 开始回测", key="backtest_btn", use_container_width=True):
                 _run_backtest_integrated(symbol, bt_start_val, bt_end_val, bt_cap_val, bt_ma_val, 
                                         bt_stop_val, bt_vision_val, bt_validation_val, 
                                         wf_train_months_val, wf_test_months_val)
+            st.markdown('</div>', unsafe_allow_html=True)
         
         # 检查是否显示因子分析
         if show_factor_analysis and "res" in st.session_state:
-            st.divider()
+            st.markdown('<div class="card-container">', unsafe_allow_html=True)
             st.subheader("📈 因子有效性分析")
             _show_factor_analysis_integrated(symbol, d["df_f"])
+            st.markdown('</div>', unsafe_allow_html=True)
 
 # --- 模式 B: 批量组合分析 ---
 elif mode == "📊 批量组合分析":
@@ -1158,69 +1345,153 @@ def _run_backtest_integrated(symbol, bt_start, bt_end, bt_cap, bt_ma, bt_stop, b
             st.error("数据获取失败")
 
 def _show_factor_analysis_integrated(symbol, df_f):
-    """整合的因子分析函数"""
+    """整合的因子分析函数 - 优化版"""
     try:
         from src.factor_analysis.ic_analysis import ICAnalyzer
         from src.factor_analysis.regime_detector import RegimeDetector
+        from src.strategies.kline_factor import KLineFactorCalculator
         
-        # 使用实际数据计算因子值和收益率
-        returns = df_f['Close'].pct_change().dropna()
+        # 使用K线学习因子作为因子值（更准确）
+        kline_factor_calc = KLineFactorCalculator()
         
-        # 简化：使用价格变化作为因子值（实际应该用K线学习因子）
-        # 这里我们使用K线学习因子的胜率作为因子值
-        factor_values = returns.rolling(window=5).mean()  # 5日平均收益率作为因子值
-        forward_returns = returns.shift(-5)  # 未来5日收益率
+        # 计算历史因子值（使用Top10匹配的胜率）
+        factor_values_list = []
+        forward_returns_list = []
+        dates_list = []
         
-        # 对齐数据
-        common_index = factor_values.index.intersection(forward_returns.index)
-        factor_values = factor_values.loc[common_index]
-        forward_returns = forward_returns.loc[common_index]
+        # 遍历历史数据，计算每个时间点的因子值
+        for i in range(20, len(df_f) - 5):
+            try:
+                # 获取当前时间点的K线图
+                current_data = df_f.iloc[i-20:i]
+                if len(current_data) < 20:
+                    continue
+                
+                # 生成临时K线图用于匹配
+                temp_img = os.path.join(PROJECT_ROOT, "data", f"temp_factor_{i}.png")
+                mc = mpf.make_marketcolors(up='red', down='green', inherit=True)
+                s = mpf.make_mpf_style(marketcolors=mc, gridstyle='')
+                mpf.plot(current_data, type='candle', style=s, savefig=dict(fname=temp_img, dpi=50), 
+                        figsize=(3, 3), axisoff=True)
+                
+                # 搜索相似模式
+                matches = eng["vision"].search_similar_patterns(temp_img, top_k=10)
+                
+                if matches:
+                    # 计算混合胜率作为因子值
+                    factor_result = kline_factor_calc.calculate_hybrid_win_rate(matches, symbol, 
+                                                                                df_f.index[i].strftime('%Y%m%d'))
+                    factor_value = factor_result.get('hybrid_win_rate', 50.0) / 100.0  # 归一化到0-1
+                    
+                    # 未来5日收益率
+                    future_return = (df_f.iloc[i+5]['Close'] - df_f.iloc[i]['Close']) / df_f.iloc[i]['Close']
+                    
+                    factor_values_list.append(factor_value)
+                    forward_returns_list.append(future_return)
+                    dates_list.append(df_f.index[i])
+                
+                # 清理临时文件
+                if os.path.exists(temp_img):
+                    os.remove(temp_img)
+                    
+            except Exception as e:
+                continue
         
-        if len(factor_values) > 20:
+        if len(factor_values_list) > 20:
+            # 转换为Series
+            factor_values = pd.Series(factor_values_list, index=dates_list)
+            forward_returns = pd.Series(forward_returns_list, index=dates_list)
+            
             # IC分析
             ic_analyzer = ICAnalyzer(factor_values, forward_returns)
-            rolling_ic = ic_analyzer.calculate_rolling_ic(window=20)
+            rolling_ic = ic_analyzer.calculate_rolling_ic(window=min(20, len(factor_values)//2))
             
-            # Regime识别
-            regime_detector = RegimeDetector(df_f['Close'])
-            regimes = regime_detector.detect_regime()
-            
-            # 绘制IC曲线
+            # 绘制IC曲线 - Google AI Studio风格
             fig = go.Figure()
             fig.add_trace(go.Scatter(
                 x=rolling_ic.index,
                 y=rolling_ic.values,
                 mode='lines',
                 name='Rolling IC',
-                line=dict(color='blue', width=2)
+                line=dict(color='#667eea', width=3),
+                fill='tozeroy',
+                fillcolor='rgba(102, 126, 234, 0.1)'
             ))
-            fig.add_hline(y=0.05, line_dash="dash", line_color="green", annotation_text="IC阈值(0.05)")
-            fig.add_hline(y=-0.05, line_dash="dash", line_color="red")
-            fig.update_layout(title="IC曲线分析", height=300)
+            fig.add_hline(y=0.05, line_dash="dash", line_color="#10b981", 
+                         annotation_text="IC阈值(0.05)", annotation_position="right")
+            fig.add_hline(y=-0.05, line_dash="dash", line_color="#ef4444", 
+                         annotation_text="IC阈值(-0.05)", annotation_position="right")
+            fig.add_hline(y=0, line_dash="dot", line_color="gray", opacity=0.5)
+            fig.update_layout(
+                title="📊 IC曲线分析 - K线学习因子有效性",
+                height=400,
+                plot_bgcolor='rgba(255, 255, 255, 0.9)',
+                paper_bgcolor='rgba(255, 255, 255, 0)',
+                font=dict(family='-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif', size=12),
+                hovermode='x unified'
+            )
             st.plotly_chart(fig, config={"displayModeBar": False}, use_container_width=True)
             
-            # 显示IC统计
+            # 显示IC统计 - Apple风格卡片
             ic_stats = ic_analyzer.get_ic_statistics(rolling_ic)
             col1, col2, col3, col4 = st.columns(4)
-            col1.metric("平均IC", f"{ic_stats['mean_ic']:.4f}")
-            col2.metric("IC标准差", f"{ic_stats['std_ic']:.4f}")
-            col3.metric("ICIR", f"{ic_stats['ic_ir']:.2f}")
-            col4.metric("正IC比例", f"{ic_stats['positive_ic_ratio']*100:.1f}%")
+            with col1:
+                st.metric("平均IC", f"{ic_stats['mean_ic']:.4f}", 
+                         delta="有效" if ic_stats['mean_ic'] > 0.05 else "无效")
+            with col2:
+                st.metric("IC标准差", f"{ic_stats['std_ic']:.4f}")
+            with col3:
+                st.metric("ICIR", f"{ic_stats['ic_ir']:.2f}", 
+                         delta="优秀" if abs(ic_stats['ic_ir']) > 1.0 else "一般")
+            with col4:
+                st.metric("正IC比例", f"{ic_stats['positive_ic_ratio']*100:.1f}%",
+                         delta="良好" if ic_stats['positive_ic_ratio'] > 0.6 else "一般")
             
-            # Regime识别图
+            # Regime识别图 - Google AI Studio风格
             st.subheader("🌍 市场Regime识别")
+            regime_detector = RegimeDetector(df_f['Close'])
+            regimes = regime_detector.detect_regime()
             regime_counts = regimes.value_counts()
+            
+            colors_map = {'Bull': '#10b981', 'Bear': '#ef4444', 'Oscillating': '#f59e0b'}
             fig_regime = go.Figure(data=[go.Bar(
                 x=regime_counts.index,
                 y=regime_counts.values,
-                marker_color=['green' if r == 'Bull' else 'red' if r == 'Bear' else 'yellow' 
-                             for r in regime_counts.index]
+                marker_color=[colors_map.get(r, '#6b7280') for r in regime_counts.index],
+                text=regime_counts.values,
+                textposition='outside'
             )])
-            fig_regime.update_layout(title="市场Regime分布", height=300)
+            fig_regime.update_layout(
+                title="市场Regime分布",
+                height=350,
+                plot_bgcolor='rgba(255, 255, 255, 0.9)',
+                paper_bgcolor='rgba(255, 255, 255, 0)',
+                font=dict(family='-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif', size=12)
+            )
             st.plotly_chart(fig_regime, config={"displayModeBar": False}, use_container_width=True)
+            
+            # 因子衰减分析
+            st.subheader("📉 因子衰减分析")
+            decay_window = min(60, len(rolling_ic))
+            recent_ic = rolling_ic.tail(decay_window).mean()
+            earlier_ic = rolling_ic.head(decay_window).mean() if len(rolling_ic) > decay_window else recent_ic
+            decay_rate = (recent_ic - earlier_ic) / abs(earlier_ic) * 100 if earlier_ic != 0 else 0
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("早期IC均值", f"{earlier_ic:.4f}")
+            with col2:
+                st.metric("近期IC均值", f"{recent_ic:.4f}", 
+                         delta=f"{decay_rate:.1f}%", 
+                         delta_color="inverse" if decay_rate < 0 else "normal")
+            
         else:
-            st.warning("数据不足，无法进行因子分析")
+            st.warning("⚠️ 数据不足，无法进行因子分析。需要至少20个有效数据点。")
+    except ImportError as e:
+        st.error(f"❌ 模块导入失败: {e}")
+        st.info("💡 提示：请确保因子分析模块已正确安装")
     except Exception as e:
-        st.error(f"因子分析失败: {e}")
+        st.error(f"❌ 因子分析失败: {e}")
         import traceback
-        st.code(traceback.format_exc())
+        with st.expander("查看详细错误信息"):
+            st.code(traceback.format_exc())
