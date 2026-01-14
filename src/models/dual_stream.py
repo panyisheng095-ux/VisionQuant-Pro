@@ -81,11 +81,11 @@ class DualStreamNetwork(nn.Module):
     
     def __init__(
         self,
-        visual_dim: int = 512,
+        visual_dim: int = 2048,  # 支持更高维度（512/1024/2048）
         temporal_dim: int = 256,
-        hidden_dim: int = 256,
+        hidden_dim: int = 512,  # 增加隐藏层维度以匹配更高维特征
         num_classes: int = 3,
-        fusion_type: str = 'attention'  # 'concat', 'attention', 'gated'
+        fusion_type: str = 'attention'  # 'concat', 'attention', 'gated', 'bilinear'
     ):
         super().__init__()
         
@@ -109,10 +109,19 @@ class DualStreamNetwork(nn.Module):
             self.visual_proj = nn.Linear(visual_dim, hidden_dim)
             self.temporal_proj = nn.Linear(temporal_dim, hidden_dim)
             self.norm = nn.LayerNorm(hidden_dim)
+        elif fusion_type == 'bilinear':
+            # 双线性融合（更强大的特征交互）
+            self.bilinear = nn.Bilinear(visual_dim, temporal_dim, hidden_dim)
+            self.norm = nn.LayerNorm(hidden_dim)
         
-        # 预测头
+        # 预测头（增强版：更深层网络）
         self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
             nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(hidden_dim // 2, num_classes)
@@ -121,6 +130,7 @@ class DualStreamNetwork(nn.Module):
         # 回归头（预测收益率）
         self.regressor = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(hidden_dim // 2, 1)
@@ -152,6 +162,10 @@ class DualStreamNetwork(nn.Module):
             v_proj = self.visual_proj(visual_feat)
             t_proj = self.temporal_proj(temporal_feat)
             fused = self.norm(gate * v_proj + (1 - gate) * t_proj)
+        elif self.fusion_type == 'bilinear':
+            # 双线性融合
+            fused = self.bilinear(visual_feat, temporal_feat)
+            fused = self.norm(fused)
         
         # 分类和回归
         class_logits = self.classifier(fused)

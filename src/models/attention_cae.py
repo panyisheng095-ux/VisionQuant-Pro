@@ -144,19 +144,22 @@ class AttentionCAE(nn.Module):
         latent_dim: int = 1024, 
         num_attention_heads: int = 8,
         dropout: float = 0.1,
-        use_attention: bool = True
+        use_attention: bool = True,
+        feature_dim: int = 256
     ):
         """
         Args:
-            latent_dim: 隐空间维度
+            latent_dim: 隐空间维度（支持512, 1024, 2048）
             num_attention_heads: 注意力头数
             dropout: Dropout比率
             use_attention: 是否使用注意力模块（用于消融实验）
+            feature_dim: 编码器最后一层的特征通道数（默认256，可提升到512）
         """
         super().__init__()
         
         self.latent_dim = latent_dim
         self.use_attention = use_attention
+        self.feature_dim = feature_dim
         
         # ========== Encoder ==========
         self.encoder = nn.Sequential(
@@ -176,37 +179,38 @@ class AttentionCAE(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
             
             # Layer 4: 28 -> 14
-            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(256),
+            nn.Conv2d(128, feature_dim, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(feature_dim),
             nn.LeakyReLU(0.2, inplace=True),
         )
         
         # ========== Self-Attention ==========
         if use_attention:
             self.attention = MultiHeadSelfAttention(
-                in_channels=256, 
+                in_channels=feature_dim, 
                 num_heads=num_attention_heads,
                 dropout=dropout
             )
         
         # ========== Latent Projection ==========
-        # 14×14×256 = 50176 -> latent_dim
+        # 14×14×feature_dim -> latent_dim
+        # 支持渐进式维度提升：256->512->1024->2048
         self.to_latent = nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, 1)),  # [B, 256, 1, 1]
-            nn.Flatten(),                   # [B, 256]
-            nn.Linear(256, latent_dim),
+            nn.AdaptiveAvgPool2d((1, 1)),  # [B, feature_dim, 1, 1]
+            nn.Flatten(),                   # [B, feature_dim]
+            nn.Linear(feature_dim, latent_dim),
             nn.LayerNorm(latent_dim)
         )
         
         # ========== Decoder ==========
         self.from_latent = nn.Sequential(
-            nn.Linear(latent_dim, 256 * 14 * 14),
+            nn.Linear(latent_dim, feature_dim * 14 * 14),
             nn.LeakyReLU(0.2, inplace=True)
         )
         
         self.decoder = nn.Sequential(
             # Layer 1: 14 -> 28
-            nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.ConvTranspose2d(feature_dim, 128, kernel_size=3, stride=2, padding=1, output_padding=1),
             nn.BatchNorm2d(128),
             nn.LeakyReLU(0.2, inplace=True),
             
@@ -239,7 +243,7 @@ class AttentionCAE(nn.Module):
             latent: L2归一化的特征向量 [B, latent_dim]
         """
         # CNN编码
-        features = self.encoder(x)  # [B, 256, 14, 14]
+        features = self.encoder(x)  # [B, feature_dim, 14, 14]
         
         # 应用注意力
         if self.use_attention:
@@ -264,8 +268,8 @@ class AttentionCAE(nn.Module):
         Returns:
             recon: 重建图像 [B, 3, 224, 224]
         """
-        x = self.from_latent(z)  # [B, 256*14*14]
-        x = x.view(-1, 256, 14, 14)  # [B, 256, 14, 14]
+        x = self.from_latent(z)  # [B, feature_dim*14*14]
+        x = x.view(-1, self.feature_dim, 14, 14)  # [B, feature_dim, 14, 14]
         recon = self.decoder(x)  # [B, 3, 224, 224]
         return recon
     
