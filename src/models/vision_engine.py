@@ -6,6 +6,7 @@ from torchvision import transforms
 from PIL import Image
 import faiss
 import pickle
+import glob
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -78,6 +79,7 @@ class VisionEngine:
 
         self.index = None
         self.meta_data = []
+        self._pixel_cache = {}
 
     def reload_index(self):
         # 优先加载 AttentionCAE 索引
@@ -125,7 +127,61 @@ class VisionEngine:
         except:
             return None
 
-    def search_similar_patterns(self, target_img_path, top_k=10, query_prices=None):
+    def _vector_score_to_similarity(self, score):
+        """将FAISS返回分数统一映射到0~1"""
+        try:
+            if self.index is not None and self.index.metric_type == faiss.METRIC_INNER_PRODUCT:
+                sim = (float(score) + 1.0) / 2.0
+            else:
+                sim = 1.0 / (1.0 + max(float(score), 0.0))
+            return float(np.clip(sim, 0.0, 1.0))
+        except Exception:
+            return 0.0
+
+    def _resolve_image_path(self, info_path, symbol, date_str):
+        """从元数据或目录中定位历史K线图片"""
+        if info_path and os.path.exists(info_path):
+            return info_path
+        img_base = os.path.join(PROJECT_ROOT, "data", "images")
+        date_n = str(date_str).replace("-", "")
+        candidates = [
+            os.path.join(img_base, f"{symbol}_{date_n}.png"),
+            os.path.join(img_base, symbol, f"{symbol}_{date_n}.png"),
+            os.path.join(img_base, symbol, f"{date_n}.png"),
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                return p
+        pattern = os.path.join(img_base, "**", f"*{symbol}*{date_n}*.png")
+        matches = glob.glob(pattern, recursive=True)
+        return matches[0] if matches else None
+
+    def _load_pixel_vector(self, img_path, size=(64, 64)):
+        """轻量像素向量（用于视觉重排）"""
+        if not img_path:
+            return None
+        if img_path in self._pixel_cache:
+            return self._pixel_cache[img_path]
+        try:
+            img = Image.open(img_path).convert("L").resize(size)
+            arr = np.asarray(img, dtype=np.float32)
+            arr = (arr - arr.mean()) / (arr.std() + 1e-6)
+            vec = arr.flatten()
+            self._pixel_cache[img_path] = vec
+            if len(self._pixel_cache) > 500:
+                self._pixel_cache.pop(next(iter(self._pixel_cache)))
+            return vec
+        except Exception:
+            return None
+
+    def _cosine_sim(self, a, b):
+        if a is None or b is None:
+            return None
+        denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-8
+        return float(np.dot(a, b) / denom)
+
+    def search_similar_patterns(self, target_img_path, top_k=10, query_prices=None,
+                                rerank_with_pixels=True, rerank_top_k=80):
         """
         混合搜索：视觉特征 + 价格序列相关性
         
@@ -216,13 +272,9 @@ class VisionEngine:
                     correlation = None
 
             # === 优化4: 评分策略（相似度校准 + 相关性增强）===
-            # Faiss 距离越小越相似 -> 转为 similarity 分数（0~1）
-            try:
-                dist = float(vector_score)
-                sim_score = 1.0 / (1.0 + max(dist, 0.0))
-            except Exception:
-                sim_score = 0.0
+            sim_score = self._vector_score_to_similarity(vector_score)
 
+            corr_norm = None
             if correlation is None:
                 final_score = sim_score
             else:
@@ -236,15 +288,106 @@ class VisionEngine:
                 "date": date_str,
                 "score": float(final_score),
                 "vector_score": float(vector_score),
-                "correlation": (None if correlation is None else float(correlation))
+                "correlation": (None if correlation is None else float(correlation)),
+                "sim_score": float(sim_score),
+                "corr_norm": (None if corr_norm is None else float(corr_norm)),
+                "path": info.get("path")
             })
 
             seen_dates.setdefault(sym, []).append(current_dt)
+
+        # === 视觉重排：像素级相似度兜底（提升“肉眼相似”效果） ===
+        if rerank_with_pixels and candidates:
+            q_vec = self._load_pixel_vector(target_img_path)
+            if q_vec is not None:
+                for c in candidates[:min(len(candidates), rerank_top_k)]:
+                    img_path = self._resolve_image_path(c.get("path"), c["symbol"], c["date"])
+                    v = self._load_pixel_vector(img_path)
+                    pix = self._cosine_sim(q_vec, v)
+                    if pix is not None:
+                        pix_norm = (pix + 1.0) / 2.0
+                        corr = c.get("corr_norm")
+                        corr_score = 0.5 if corr is None else corr
+                        c["pixel_sim"] = pix_norm
+                        c["score"] = 0.6 * c.get("sim_score", 0) + 0.3 * pix_norm + 0.1 * corr_score
 
         # === 优化6: 排序并返回（保证Top-K） ===
         candidates.sort(key=lambda x: x['score'], reverse=True)
 
         # 返回Top-K
+        return candidates[:top_k]
+
+    def generate_attention_heatmap(self, img_path, save_path=None):
+        """
+        生成注意力热力图（如果模型支持注意力权重）
+        """
+        try:
+            from src.utils.attention_visualizer import AttentionVisualizer
+            if not hasattr(self.model, "get_attention_weights"):
+                return None
+            # 读取并预处理
+            img = Image.open(img_path).convert('RGB')
+            input_tensor = self.preprocess(img)
+            visualizer = AttentionVisualizer(self.model, device=str(self.device))
+            fig = visualizer.visualize_single_attention(
+                input_tensor, head_idx=0, query_pos=(7, 7), save_path=save_path
+            )
+            return save_path
+        except Exception:
+            return None
+
+    def search_multi_scale_patterns(self, img_paths: dict, top_k=10, weights=None, query_prices=None,
+                                    rerank_with_pixels=True, rerank_top_k=80):
+        """
+        多尺度检索：日/周/月图像分别检索，再加权融合
+        """
+        if self.index is None:
+            if not self.reload_index():
+                return []
+        if not img_paths:
+            return []
+        if weights is None:
+            weights = {"daily": 0.6, "weekly": 0.3, "monthly": 0.1}
+
+        merged = {}
+        for scale, path in img_paths.items():
+            vec = self._image_to_vector(path)
+            if vec is None:
+                continue
+            vec = vec.astype('float32').reshape(1, -1)
+            faiss.normalize_L2(vec)
+            search_k = max(top_k * 10, 200)
+            D, I = self.index.search(vec, search_k)
+            for vector_score, idx in zip(D[0], I[0]):
+                if idx >= len(self.meta_data):
+                    continue
+                info = self.meta_data[idx]
+                sym = str(info['symbol']).zfill(6)
+                date_str = str(info['date'])
+                key = (sym, date_str)
+                # 距离转相似度
+                sim = self._vector_score_to_similarity(vector_score)
+                w = weights.get(scale, 0.0)
+                merged[key] = merged.get(key, 0.0) + sim * w
+
+        # 相关性增强（仅对日线使用）
+        candidates = []
+        for (sym, date_str), score in merged.items():
+            candidates.append({"symbol": sym, "date": date_str, "score": float(score), "path": None})
+
+        # 像素重排（使用日线Query）
+        if rerank_with_pixels and candidates and img_paths.get("daily"):
+            q_vec = self._load_pixel_vector(img_paths.get("daily"))
+            if q_vec is not None:
+                for c in candidates[:min(len(candidates), rerank_top_k)]:
+                    img_path = self._resolve_image_path(None, c["symbol"], c["date"])
+                    v = self._load_pixel_vector(img_path)
+                    pix = self._cosine_sim(q_vec, v)
+                    if pix is not None:
+                        pix_norm = (pix + 1.0) / 2.0
+                        c["pixel_sim"] = pix_norm
+                        c["score"] = 0.7 * c["score"] + 0.3 * pix_norm
+        candidates.sort(key=lambda x: x["score"], reverse=True)
         return candidates[:top_k]
 
 

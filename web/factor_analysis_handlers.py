@@ -54,7 +54,16 @@ def show_factor_analysis(symbol, df_f, eng, PROJECT_ROOT):
         _plot_ic_curve(rolling_ic, ic_result)
         _plot_sharpe_curve(ic_result)
         _plot_regime_distribution(df_f)
-        _plot_decay_analysis(rolling_ic)
+
+        # 衰减 + 拐点检测（Change Point / CUSUM）
+        try:
+            from src.factor_analysis.decay_analysis import DecayAnalyzer
+            decay_analyzer = DecayAnalyzer()
+            decay_result = decay_analyzer.analyze_decay(rolling_ic)
+        except Exception:
+            decay_result = {}
+
+        _plot_decay_analysis(rolling_ic, decay_result)
         _detect_invalidation(factor_series, returns_series)
         
     except ImportError as e:
@@ -149,12 +158,16 @@ def _plot_ic_curve(rolling_ic, ic_result):
     std_ic = float(summary.get("std_ic", rolling_ic.std()))
     ic_ir = float(summary.get("ir", mean_ic / std_ic if std_ic > 0 else 0.0))
     positive_ratio = float(summary.get("positive_ratio", (rolling_ic > 0).mean() if len(rolling_ic) else 0.0))
-    col1, col2, col3, col4 = st.columns(4)
+    half_life = summary.get("half_life", None)
+    stability = summary.get("stability_score", None)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("平均IC", f"{mean_ic:.4f}", delta="有效" if mean_ic > 0.05 else "无效")
     col2.metric("IC标准差", f"{std_ic:.4f}")
     col3.metric("ICIR", f"{ic_ir:.2f}", delta="优秀" if abs(ic_ir) > 1.0 else "一般")
     col4.metric("正IC比例", f"{positive_ratio*100:.1f}%",
                delta="良好" if positive_ratio > 0.6 else "一般")
+    col5.metric("IC Half-Life", f"{half_life:.1f}" if half_life is not None else "N/A")
+    col6.metric("稳定性评分", f"{float(stability):.2f}" if stability is not None else "N/A")
 
 def _plot_sharpe_curve(ic_result):
     """绘制Rolling Sharpe曲线"""
@@ -195,7 +208,7 @@ def _plot_regime_distribution(df_f):
     fig.update_layout(title="市场Regime分布", height=300)
     st.plotly_chart(fig, config={"displayModeBar": False}, use_container_width=True)
 
-def _plot_decay_analysis(rolling_ic):
+def _plot_decay_analysis(rolling_ic, decay_result=None):
     """因子衰减分析"""
     import streamlit as st
     
@@ -209,6 +222,12 @@ def _plot_decay_analysis(rolling_ic):
     col1.metric("早期IC均值", f"{earlier_ic:.4f}")
     col2.metric("近期IC均值", f"{recent_ic:.4f}", delta=f"{decay_rate:.1f}%",
                delta_color="inverse" if decay_rate < 0 else "normal")
+
+    # 拐点信息
+    if decay_result:
+        cps = decay_result.get("change_points", [])
+        if cps:
+            st.caption(f"检测到拐点: {', '.join([str(c) for c in cps[-3:]])}")
 
 def _detect_invalidation(factor_values, forward_returns):
     """因子失效检测"""

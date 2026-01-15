@@ -67,6 +67,9 @@ class DecayAnalyzer:
         
         # 3. 预测失效时间
         invalidation_date = self._predict_invalidation(ic_series, decay_rate)
+
+        # 4. Change Point & CUSUM
+        change_points = self._detect_change_points_cusum(ic_series)
         
         # 4. 判断是否正在衰减
         recent_ic = ic_series.tail(self.window).mean()
@@ -79,8 +82,29 @@ class DecayAnalyzer:
             'predicted_invalidation_date': invalidation_date,
             'recent_ic_mean': float(recent_ic),
             'recent_ic_std': float(ic_series.tail(self.window).std()),
-            'method': method
+            'method': method,
+            'change_points': change_points
         }
+
+    def _detect_change_points_cusum(self, ic_series: pd.Series, threshold: float = 0.5) -> list:
+        """
+        使用CUSUM检测衰减拐点（简化实现）
+        """
+        s = ic_series.dropna()
+        if len(s) < self.window:
+            return []
+        mean = s.mean()
+        std = s.std() if s.std() > 1e-6 else 1.0
+        cpos, cneg = 0.0, 0.0
+        points = []
+        for idx, val in s.items():
+            k = (val - mean) / std
+            cpos = max(0.0, cpos + k)
+            cneg = min(0.0, cneg + k)
+            if cpos > threshold or abs(cneg) > threshold:
+                points.append(idx)
+                cpos, cneg = 0.0, 0.0
+        return points[-3:]  # 仅保留最近的几个拐点
     
     def _detect_decay_start(
         self,

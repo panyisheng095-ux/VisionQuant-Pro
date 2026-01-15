@@ -1,4 +1,5 @@
 import os
+import glob
 import sys
 import pandas as pd
 import numpy as np
@@ -27,6 +28,7 @@ class BatchAnalyzer:
         
         self.engines = engines
         self.max_workers = 8  # 控制并发，避免API限流
+        self._data_cache = {}  # 简易缓存，加速批量
         
         # K线因子计算器（混合胜率）
         self.kline_factor_calc = KLineFactorCalculator(
@@ -94,28 +96,42 @@ class BatchAnalyzer:
         """单股票快速分析（跳过可视化）"""
         try:
             # 1. 数据获取
-            df = self.engines["loader"].get_stock_data(symbol)
+            df = self._get_stock_cached(symbol)
             if df.empty:
                 return {"symbol": symbol, "error": "数据获取失败", "score": 0, "action": "ERROR"}
 
             # 2. 财务数据
             fund_data = self.engines["fund"].get_stock_fundamentals(symbol)
             stock_name = fund_data.get('name', symbol)
+            try:
+                industry_name, _ = self.engines["fund"].get_industry_peers(symbol)
+            except Exception:
+                industry_name = "未知"
 
-            # 3. 视觉搜索（简化：只取Top-3，不生成对比图）
-            q_p = os.path.join(PROJECT_ROOT, "data", f"temp_batch_{symbol}.png")
-            mc = mpf.make_marketcolors(up='red', down='green', inherit=True)
-            s = mpf.make_mpf_style(marketcolors=mc, gridstyle='')
-            mpf.plot(df.tail(20), type='candle', style=s,
-                     savefig=dict(fname=q_p, dpi=50), figsize=(3, 3), axisoff=True)
+            # 3. 快速路径：预测缓存命中则跳过视觉检索（大幅加速）
+            today_key = (symbol, datetime.now().strftime("%Y%m%d"))
+            if today_key in self.prediction_cache:
+                win_rate = float(self.prediction_cache[today_key])
+                matches = []
+            else:
+                # 视觉搜索（简化：只取Top-10，不生成对比图）
+                date_str = df.index[-1].strftime("%Y%m%d")
+                q_p = self._find_existing_kline_image(symbol, date_str)
+                if not q_p:
+                    q_p = os.path.join(PROJECT_ROOT, "data", f"temp_batch_{symbol}.png")
+                    mc = mpf.make_marketcolors(up='red', down='green', inherit=True)
+                    s = mpf.make_mpf_style(marketcolors=mc, gridstyle='')
+                    mpf.plot(df.tail(20), type='candle', style=s,
+                             savefig=dict(fname=q_p, dpi=50), figsize=(3, 3), axisoff=True)
 
-            matches = self.engines["vision"].search_similar_patterns(q_p, top_k=10)
+                matches = self.engines["vision"].search_similar_patterns(q_p, top_k=10)
 
             # 4. 混合胜率计算（Triple Barrier + 传统胜率）
-            win_rate_result = self.kline_factor_calc.calculate_hybrid_win_rate(
-                matches, query_symbol=symbol, query_date=datetime.now().strftime("%Y%m%d")
-            )
-            win_rate = win_rate_result['hybrid_win_rate']
+                win_rate_result = self.kline_factor_calc.calculate_hybrid_win_rate(
+                    matches, query_symbol=symbol, query_date=datetime.now().strftime("%Y%m%d")
+                )
+                win_rate = win_rate_result['hybrid_win_rate']
+            dist = self.kline_factor_calc.calculate_return_distribution(matches, horizon_days=20) if matches else {"valid": False}
 
             # 5. 技术指标
             df_f = self.engines["factor"]._add_technical_indicators(df)
@@ -140,8 +156,11 @@ class BatchAnalyzer:
                 confidence = int(total_score * 10)
                 reasoning = "快速分析模式"
 
-            # 8. 预期收益（简化）
-            expected_return = self._estimate_return(win_rate, df_f.iloc[-1])
+            # 8. 预期收益（分布估计优先）
+            if dist and dist.get("valid"):
+                expected_return = dist.get("mean", 0.0)
+            else:
+                expected_return = self._estimate_return(win_rate, df_f.iloc[-1])
 
             return {
                 "symbol": symbol,
@@ -151,8 +170,11 @@ class BatchAnalyzer:
                 "confidence": confidence,
                 "win_rate": round(win_rate, 1),
                 "expected_return": round(expected_return, 2),
+                "cvar": round(dist.get("cvar", 0.0), 2) if dist and dist.get("valid") else 0.0,
                 "roe": round(fund_data.get('roe', 0), 2),
                 "pe_ttm": round(fund_data.get('pe_ttm', 0), 2),
+                "market_cap": round(fund_data.get('total_mv', 0), 2),
+                "industry": industry_name,
                 "reasoning": reasoning,
                 "details": s_details,
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -188,6 +210,32 @@ class BatchAnalyzer:
             return min(70, max(50, win_rate))
 
         return 50.0
+
+    def _get_stock_cached(self, symbol):
+        """简单缓存，减少重复IO"""
+        if symbol in self._data_cache:
+            return self._data_cache[symbol]
+        df = self.engines["loader"].get_stock_data(symbol)
+        self._data_cache[symbol] = df
+        # 控制缓存大小
+        if len(self._data_cache) > 50:
+            self._data_cache.pop(next(iter(self._data_cache)))
+        return df
+
+    def _find_existing_kline_image(self, symbol: str, date_str: str):
+        img_base = os.path.join(PROJECT_ROOT, "data", "images")
+        date_n = str(date_str).replace("-", "")
+        candidates = [
+            os.path.join(img_base, f"{symbol}_{date_n}.png"),
+            os.path.join(img_base, symbol, f"{symbol}_{date_n}.png"),
+            os.path.join(img_base, symbol, f"{date_n}.png"),
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                return p
+        pattern = os.path.join(img_base, "**", f"*{symbol}*{date_n}*.png")
+        matches = glob.glob(pattern, recursive=True)
+        return matches[0] if matches else None
 
     def _estimate_return(self, win_rate, factor_row):
         """估算预期收益"""

@@ -17,7 +17,8 @@ class PortfolioOptimizer:
     
     def optimize_multi_tier_portfolio(self, analysis_results, loader, 
                                      min_weight=0.05, max_weight=0.25,
-                                     max_positions=10, risk_aversion=1.0):
+                                     max_positions=10, risk_aversion=1.0,
+                                     cvar_limit: float = 0.05, cvar_alpha: float = 0.05):
         """
         三层分级组合优化（新逻辑）
         
@@ -82,12 +83,12 @@ class PortfolioOptimizer:
         # 2. 权重优化（核心/增强同时存在时 70/30；否则单层 100%）
         core_weights = self._optimize_single_tier(
             core_stocks, loader, min_weight, max_weight,
-            max_positions, risk_aversion
+            max_positions, risk_aversion, cvar_limit, cvar_alpha
         ) if core_stocks else {}
 
         enhanced_weights = self._optimize_single_tier(
             enhanced_stocks, loader, 0.05, 0.20,
-            max_positions, risk_aversion
+            max_positions, risk_aversion, cvar_limit, cvar_alpha
         ) if enhanced_stocks else {}
 
         if core_weights and enhanced_weights:
@@ -119,7 +120,7 @@ class PortfolioOptimizer:
         }
     
     def _optimize_single_tier(self, stocks, loader, min_weight, max_weight, 
-                             max_positions, risk_aversion):
+                             max_positions, risk_aversion, cvar_limit, cvar_alpha):
         """优化单层组合"""
         if len(stocks) == 0:
             return {}
@@ -138,6 +139,7 @@ class PortfolioOptimizer:
         
         # 计算期望收益和协方差矩阵
         expected_returns = self._calculate_expected_returns(sorted_stocks)
+        view_confidences = self._calculate_view_confidences(sorted_stocks)
         cov_matrix = self._calculate_covariance_matrix(symbols, loader)
         
         if cov_matrix is None or len(cov_matrix) == 0:
@@ -146,18 +148,20 @@ class PortfolioOptimizer:
         # Black-Litterman 优化（Q10：不选C/D）
         try:
             bl_returns = self._black_litterman_expected_returns(
-                expected_returns, cov_matrix
+                expected_returns, cov_matrix, view_confidences=view_confidences
             )
             weights = self._markowitz_optimize(
                 bl_returns, cov_matrix,
-                min_weight, max_weight, risk_aversion
+                min_weight, max_weight, risk_aversion,
+                cvar_limit=cvar_limit, cvar_alpha=cvar_alpha
             )
         except Exception:
             # 回退到 Markowitz
             try:
                 weights = self._markowitz_optimize(
                     expected_returns, cov_matrix,
-                    min_weight, max_weight, risk_aversion
+                    min_weight, max_weight, risk_aversion,
+                    cvar_limit=cvar_limit, cvar_alpha=cvar_alpha
                 )
             except Exception:
                 return self._simple_weight_allocation(sorted_stocks, min_weight, max_weight)
@@ -264,7 +268,8 @@ class PortfolioOptimizer:
             return False
     
     def _markowitz_optimize(self, expected_returns, cov_matrix, 
-                           min_weight, max_weight, risk_aversion):
+                           min_weight, max_weight, risk_aversion,
+                           cvar_limit: float = 0.05, cvar_alpha: float = 0.05):
         """
         马科维茨均值-方差优化
         
@@ -291,7 +296,8 @@ class PortfolioOptimizer:
         
         # 约束条件
         constraints = [
-            {'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0}  # 权重和为1
+            {'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0},  # 权重和为1
+            {'type': 'ineq', 'fun': lambda w: cvar_limit - self._portfolio_cvar(w, expected_returns, cov_matrix, cvar_alpha)}
         ]
         
         # 边界条件
@@ -317,6 +323,7 @@ class PortfolioOptimizer:
             return np.array([1.0 / n] * n)
 
     def _black_litterman_expected_returns(self, expected_returns, cov_matrix,
+                                          view_confidences=None,
                                           tau: float = 0.05, delta: float = 2.5):
         """
         计算 Black-Litterman 融合后的期望收益
@@ -337,8 +344,12 @@ class PortfolioOptimizer:
         P = np.eye(n)
         Q = expected_returns.reshape(-1, 1)
 
-        # Omega（观点不确定性）
-        omega = np.diag(np.diag(P.dot(tau * cov_matrix).dot(P.T)))
+        # Omega（观点不确定性）：置信度越高，不确定性越低
+        base_omega = np.diag(np.diag(P.dot(tau * cov_matrix).dot(P.T)))
+        if view_confidences is None:
+            view_confidences = np.ones(n)
+        view_confidences = np.clip(np.array(view_confidences), 0.2, 1.0)
+        omega = base_omega / view_confidences.reshape(-1, 1)
 
         # BL 公式
         inv_tau_sigma = np.linalg.inv(tau * cov_matrix)
@@ -347,6 +358,50 @@ class PortfolioOptimizer:
         mu_bl = middle.dot(inv_tau_sigma.dot(pi.reshape(-1, 1)) + P.T.dot(inv_omega).dot(Q))
 
         return mu_bl.flatten()
+
+    def _calculate_view_confidences(self, sorted_stocks):
+        """根据因子置信度生成观点权重（0.2-1.0）"""
+        confs = []
+        for _, data in sorted_stocks:
+            try:
+                raw_conf = float(data.get("confidence", 0))
+            except Exception:
+                raw_conf = 0.0
+            score = float(data.get("score", 0)) / 10.0
+            win = float(data.get("win_rate", 50)) / 100.0
+            conf = raw_conf / 100.0 if raw_conf > 0 else 0.5 * score + 0.5 * win
+            conf = min(max(conf, 0.2), 1.0)
+            confs.append(conf)
+        return confs
+
+    def _portfolio_cvar(self, weights, expected_returns, cov_matrix, alpha: float = 0.05):
+        """正态近似CVaR（损失为正）"""
+        mu = float(np.dot(weights, expected_returns))
+        sigma = float(np.sqrt(np.dot(weights, np.dot(cov_matrix, weights))))
+        if sigma <= 1e-8:
+            return 0.0
+        # 正态分布CVaR系数（固定近似，避免随机性）
+        z = -1.645 if alpha <= 0.05 else -1.282
+        phi = (1.0 / np.sqrt(2 * np.pi)) * np.exp(-0.5 * z * z)
+        cvar = -(mu - sigma * (phi / max(alpha, 1e-6)))
+        return max(cvar, 0.0)
+
+    def propose_rebalance(self, current_weights, target_weights, max_turnover: float = 0.2):
+        """根据换手上限生成再平衡建议"""
+        if not current_weights:
+            return target_weights, {"turnover": 0.0}
+        all_syms = set(current_weights) | set(target_weights)
+        diffs = {s: target_weights.get(s, 0) - current_weights.get(s, 0) for s in all_syms}
+        turnover = sum(abs(v) for v in diffs.values())
+        if turnover <= max_turnover:
+            return target_weights, {"turnover": turnover}
+        scale = max_turnover / turnover if turnover > 0 else 1.0
+        adj = {s: current_weights.get(s, 0) + diffs[s] * scale for s in all_syms}
+        # 归一化
+        total = sum(max(v, 0) for v in adj.values())
+        if total > 0:
+            adj = {k: max(v, 0) / total for k, v in adj.items()}
+        return adj, {"turnover": max_turnover}
     
     def _simple_weight_allocation(self, sorted_stocks, min_weight, max_weight):
         """简化权重分配（按评分比例）"""
@@ -404,9 +459,28 @@ class PortfolioOptimizer:
             sharpe_ratio = portfolio_return / portfolio_risk
         else:
             sharpe_ratio = 0
+
+        # CVaR（正态近似）
+        cov_matrix = self._calculate_covariance_matrix(symbols, loader)
+        cvar = None
+        if cov_matrix is not None:
+            w_vec = np.array([weights[s] for s in symbols])
+            cvar = self._portfolio_cvar(w_vec, np.array(expected_returns), cov_matrix)
+
+        # 风险贡献（Budget）
+        risk_budget = {}
+        if cov_matrix is not None:
+            w_vec = np.array([weights[s] for s in symbols])
+            port_vol = np.sqrt(np.dot(w_vec, np.dot(cov_matrix, w_vec)))
+            if port_vol > 0:
+                mrc = np.dot(cov_matrix, w_vec) / port_vol
+                for i, s in enumerate(symbols):
+                    risk_budget[s] = round(float(w_vec[i] * mrc[i]), 6)
         
         return {
             "expected_return": round(portfolio_return * 100, 2),
             "risk": round(portfolio_risk * 100, 2),
-            "sharpe_ratio": round(sharpe_ratio, 2)
+            "sharpe_ratio": round(sharpe_ratio, 2),
+            "cvar": round(float(cvar) * 100, 2) if cvar is not None else None,
+            "risk_budget": risk_budget
         }

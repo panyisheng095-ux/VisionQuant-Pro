@@ -199,6 +199,9 @@ class ICAnalyzer:
         t_stat, p_value = stats.ttest_1samp(ic_series.dropna(), 0)
         is_significant = p_value < 0.05
         
+        half_life = self._ic_half_life(ic_series)
+        stability_score = self._ic_stability_score(ic_series)
+
         return {
             'ic_series': ic_series,
             'sharpe_series': sharpe_series,
@@ -212,15 +215,47 @@ class ICAnalyzer:
             'sharpe_mean': sharpe_mean,
             'sharpe_std': sharpe_std,
             'sharpe_positive_ratio': sharpe_positive_ratio,
+            'half_life': half_life,
+            'stability_score': stability_score,
             'summary': {
                 'mean_ic': round(ic_mean, 4),
                 'std_ic': round(ic_std, 4),
                 'ir': round(ic_ir, 4),
                 'positive_ratio': round(ic_positive_ratio, 2),
                 'significant': is_significant,
-                'mean_sharpe': round(sharpe_mean, 4)
+                'mean_sharpe': round(sharpe_mean, 4),
+                'half_life': None if half_life is None else round(float(half_life), 2),
+                'stability_score': round(float(stability_score), 4)
             }
         }
+
+    def _ic_half_life(self, ic_series: pd.Series) -> Optional[float]:
+        """IC Half-Life（基于AR(1)近似）"""
+        s = ic_series.dropna()
+        if len(s) < 20:
+            return None
+        x = s.shift(1).dropna()
+        y = s.loc[x.index]
+        if len(x) < 10:
+            return None
+        # 估计AR(1)系数
+        phi = np.corrcoef(x.values, y.values)[0, 1]
+        if phi is None or phi <= 0 or phi >= 0.999:
+            return None
+        half_life = -np.log(2) / np.log(phi)
+        return float(half_life)
+
+    def _ic_stability_score(self, ic_series: pd.Series) -> float:
+        """IC Stability Score（越高越稳定）"""
+        s = ic_series.dropna()
+        if len(s) == 0:
+            return 0.0
+        mean_ic = s.mean()
+        std_ic = s.std()
+        if std_ic <= 0:
+            return 1.0
+        score = 1 - (std_ic / (abs(mean_ic) + 1e-6))
+        return float(np.clip(score, 0.0, 1.0))
     
     def calculate_ic_decay(
         self,

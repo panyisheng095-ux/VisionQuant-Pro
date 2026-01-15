@@ -130,6 +130,46 @@ class KLineFactorCalculator:
             'tb_details': tb_result,
             'message': '计算成功'
         }
+
+    def calculate_return_distribution(self, matches: List[Dict], horizon_days: int = 20) -> Dict:
+        """
+        更严格的收益分布估计（均值/分位数/CVaR）
+        """
+        if not self.data_loader or not matches:
+            return {"valid": False}
+        returns = []
+        for m in matches:
+            symbol = str(m.get("symbol", "")).zfill(6)
+            date_str = str(m.get("date", ""))
+            try:
+                match_date = pd.to_datetime(date_str) if "-" in date_str else pd.to_datetime(date_str, format="%Y%m%d")
+                df = self.data_loader.get_stock_data(symbol)
+                if df is None or df.empty:
+                    continue
+                df.index = pd.to_datetime(df.index)
+                if match_date in df.index:
+                    loc = df.index.get_loc(match_date)
+                    if loc + horizon_days < len(df):
+                        entry = df.iloc[loc]["Close"]
+                        future = df.iloc[loc + horizon_days]["Close"]
+                        returns.append((future - entry) / entry * 100)
+            except Exception:
+                continue
+        if not returns:
+            return {"valid": False}
+        s = pd.Series(returns)
+        q05 = float(s.quantile(0.05))
+        cvar = float(s[s <= q05].mean()) if (s <= q05).any() else q05
+        return {
+            "valid": True,
+            "mean": float(s.mean()),
+            "median": float(s.median()),
+            "q05": q05,
+            "q25": float(s.quantile(0.25)),
+            "q75": float(s.quantile(0.75)),
+            "cvar": cvar,
+            "count": int(len(s))
+        }
     
     def _calculate_triple_barrier_win_rate(self, matches: List[Dict]) -> Dict:
         """

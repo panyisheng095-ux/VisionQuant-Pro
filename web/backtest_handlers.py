@@ -177,11 +177,25 @@ def _run_simple_backtest(df, symbol, bt_cap, bt_ma, bt_stop, bt_vision, eng, PRO
     if max_dd <= -0.15:
         st.warning("⚠️ 最大回撤超过 15%，风险偏高（按你的约束阈值提示）")
 
-    # 多基线对比（Q14D）
-    baseline_df = _compute_baseline_returns(df)
+    # 多基线对比 + 统计检验（Q14D + Q18）
+    baseline_df, baseline_returns = _compute_baseline_returns(df)
     if not baseline_df.empty:
         st.subheader("📊 基线策略对比（多基线）")
         st.dataframe(baseline_df, use_container_width=True, hide_index=True)
+        # 统计显著性（与各基线的差异t检验）
+        try:
+            import scipy.stats as stats
+            test_rows = []
+            for name, b_ret in baseline_returns.items():
+                aligned = pd.concat([daily_ret, b_ret], axis=1).dropna()
+                if len(aligned) >= 20:
+                    t_stat, p_val = stats.ttest_rel(aligned.iloc[:, 0], aligned.iloc[:, 1])
+                    test_rows.append({"基线": name, "t值": round(t_stat, 3), "p值": round(p_val, 4)})
+            if test_rows:
+                st.caption("统计检验（配对t检验，p值越小代表差异显著）")
+                st.dataframe(pd.DataFrame(test_rows), hide_index=True, use_container_width=True)
+        except Exception:
+            pass
 
     # Transaction Cost 明细（Q4：ABCD）
     if cost_summary:
@@ -220,6 +234,7 @@ def _backtest_loop(df, symbol, bt_cap, bt_ma, bt_stop, bt_vision, vision_map, co
     entry_price = 0.0
     max_turnover = 0.20
     prev_close = None
+    last_buy_idx = None  # T+1约束：买入当天不能卖出
     trades_count = 0
     cost_summary = {
         "total_cost": 0.0,
@@ -270,6 +285,11 @@ def _backtest_loop(df, symbol, bt_cap, bt_ma, bt_stop, bt_vision, vision_map, co
                 equity.append(cash + shares * p)
                 prev_close = p
                 continue
+            # T+1：买入当天不允许卖出
+            if diff < 0 and last_buy_idx is not None and row.name <= last_buy_idx:
+                equity.append(cash + shares * p)
+                prev_close = p
+                continue
 
             trade_value = abs(diff * p)
             volatility = df['Close'].pct_change().std() if len(df) > 1 else 0.02
@@ -279,6 +299,10 @@ def _backtest_loop(df, symbol, bt_cap, bt_ma, bt_stop, bt_vision, vision_map, co
             try:
                 cost_result = cost_calc.calculate_cost(trade_value, p, max(volume, 1), volatility, diff > 0)
                 total_cost = cost_result.get('total_cost', trade_value * 0.001)
+                # 动态交易成本（波动/流动性敏感）
+                liquidity_ratio = abs(diff) / max(volume, 1)
+                cost_mult = 1.0 + min(1.5, max(0.0, volatility - 0.2)) + min(1.0, liquidity_ratio * 10)
+                total_cost *= cost_mult
             except:
                 total_cost = trade_value * 0.001
                 cost_result = {}
@@ -288,6 +312,7 @@ def _backtest_loop(df, symbol, bt_cap, bt_ma, bt_stop, bt_vision, vision_map, co
                 shares += diff
                 if entry_price == 0:
                     entry_price = p
+                last_buy_idx = row.name
                 trades_count += 1
             elif diff < 0:
                 pnl = (p - entry_price) / entry_price if entry_price > 0 and shares > 0 else 0
@@ -358,9 +383,16 @@ def _compute_baseline_returns(df):
             {"基线": "MACD>0", "收益率": f"{macd_ret*100:.2f}%"},
             {"基线": "Momentum(20)", "收益率": f"{mom_ret*100:.2f}%"},
         ]
-        return pd.DataFrame(data)
+        baseline_returns = {
+            "Buy&Hold": returns,
+            "MA 20/60": returns * ma_signal.shift(1).fillna(0.0),
+            "RSI(14)": returns * rsi_signal.shift(1).fillna(0.0),
+            "MACD>0": returns * macd_signal.shift(1).fillna(0.0),
+            "Momentum(20)": returns * mom_signal.shift(1).fillna(0.0),
+        }
+        return pd.DataFrame(data), baseline_returns
     except Exception:
-        return pd.DataFrame()
+        return pd.DataFrame(), {}
 
 def _calc_target_position(p, ma60, ma20, macd, ai_win, bt_vision):
     """计算目标仓位"""
@@ -403,6 +435,87 @@ def _display_wf_results(all_results, wf_train_months, wf_test_months):
     col2.metric("平均Alpha", f"{avg_alpha:.2f}%", delta="超额收益" if avg_alpha > 0 else "跑输基准")
     col3.metric("胜率", f"{win_rate:.1f}%", delta="优秀" if win_rate > 60 else "一般")
     col4.metric("Fold数量", f"{len(all_results)}个")
+
+def run_stratified_backtest_batch(symbols, eng, bt_ma=60, bt_stop=8, bt_vision=57):
+    """
+    分层回测：行业/市值/风格 + 显著性检验
+    """
+    import pandas as pd
+    import numpy as np
+    from scipy import stats
+    from src.backtest.stock_stratifier import StockStratifier
+    from src.strategies.transaction_cost import AdvancedTransactionCost
+
+    rows = []
+    loader = eng["loader"]
+    for sym in symbols:
+        try:
+            data = eng["fund"].get_stock_fundamentals(sym)
+            ind, _ = eng["fund"].get_industry_peers(sym)
+            df = loader.get_stock_data(sym)
+            if df is None or df.empty or len(df) < 80:
+                continue
+            df.index = pd.to_datetime(df.index)
+            df = _calc_indicators(df, bt_ma)
+            if df.empty:
+                continue
+            # 风格：动量 or 均值回归
+            mom60 = (df["Close"].iloc[-1] / df["Close"].iloc[-60] - 1) if len(df) > 60 else 0.0
+            style = "momentum" if mom60 > 0 else "mean_reversion"
+            rows.append({
+                "symbol": sym,
+                "market_cap": data.get("total_mv", 0),
+                "industry": ind or "未知",
+                "style": style
+            })
+        except Exception:
+            continue
+
+    if not rows:
+        return pd.DataFrame()
+
+    strat_df = pd.DataFrame(rows)
+    stratifier = StockStratifier()
+    strat_df = stratifier.stratify_combined(strat_df, market_cap_col="market_cap", industry_col="industry")
+    strat_df["stratum"] = strat_df["stratum"].astype(str) + "_" + strat_df["style"].astype(str)
+
+    results = []
+    cost_calc = AdvancedTransactionCost()
+    vision_map = {}
+    for stratum in strat_df["stratum"].unique():
+        sub = strat_df[strat_df["stratum"] == stratum]
+        rets = []
+        alphas = []
+        for _, row in sub.iterrows():
+            sym = row["symbol"]
+            try:
+                df = loader.get_stock_data(sym)
+                if df is None or df.empty or len(df) < 80:
+                    continue
+                df.index = pd.to_datetime(df.index)
+                df = _calc_indicators(df, bt_ma)
+                if df.empty:
+                    continue
+                # 用视觉阈值生成交易逻辑
+                ret, bench_ret, _ = _backtest_loop(
+                    df, sym, 100000, bt_ma, bt_stop, bt_vision, vision_map, cost_calc
+                )
+                rets.append(ret)
+                alphas.append(ret - bench_ret)
+            except Exception:
+                continue
+        if len(rets) == 0:
+            continue
+        # 统计显著性：alpha 是否显著 > 0
+        t_stat, p_val = stats.ttest_1samp(alphas, 0) if len(alphas) >= 3 else (0.0, 1.0)
+        results.append({
+            "分层": stratum,
+            "样本数": len(rets),
+            "平均收益": round(float(np.mean(rets)), 2),
+            "平均Alpha": round(float(np.mean(alphas)), 2),
+            "p值": round(float(p_val), 4)
+        })
+    return pd.DataFrame(results)
 
 def _run_stress_test(df, symbol, bt_cap, bt_ma, bt_stop, bt_vision, eng, PROJECT_ROOT):
     """Stress Testing - 极端市场条件测试"""
@@ -523,12 +636,20 @@ def _run_stress_test(df, symbol, bt_cap, bt_ma, bt_stop, bt_vision, eng, PROJECT
                 roll_cum = (1.0 + rets).rolling(window).apply(lambda x: float(np.prod(x) - 1.0), raw=True)
                 worst_ends = roll_cum.nsmallest(3).dropna().index.tolist()
 
-                # 2) 最高波动窗口
+                # 2) 最高波动窗口（波动爆发）
                 roll_vol = rets.rolling(window).std() * np.sqrt(252)
                 vol_end = roll_vol.nlargest(1).dropna().index.tolist()
 
+                # 3) “熔断”代理：单日最大下跌，取其窗口
+                min_day = rets.nsmallest(1).dropna().index.tolist()
+
+                # 4) 低流动性窗口（成交量滚动均值最低）
+                vol_series = df_indicators.get("Volume", pd.Series(index=df_indicators.index, data=np.nan))
+                roll_liq = vol_series.rolling(window).mean()
+                low_liq_end = roll_liq.nsmallest(1).dropna().index.tolist()
+
                 end_dates = []
-                for d in worst_ends + vol_end:
+                for d in worst_ends + vol_end + min_day + low_liq_end:
                     if d not in end_dates:
                         end_dates.append(d)
 
@@ -542,7 +663,14 @@ def _run_stress_test(df, symbol, bt_cap, bt_ma, bt_stop, bt_vision, eng, PROJECT
 
                     cost_calc = AdvancedTransactionCost()
                     r, b, t = _backtest_loop(segment, symbol, bt_cap, bt_ma, bt_stop, bt_vision, vision_map, cost_calc)
-                    label = "最高波动窗口" if end_dt in vol_end else f"最差滚动收益窗口#{j}"
+                    if end_dt in vol_end:
+                        label = "波动爆发窗口"
+                    elif end_dt in min_day:
+                        label = "熔断代理窗口"
+                    elif end_dt in low_liq_end:
+                        label = "低流动性窗口"
+                    else:
+                        label = f"最差滚动收益窗口#{j}"
                     auto_results[label] = {
                         "return": r,
                         "benchmark": b,

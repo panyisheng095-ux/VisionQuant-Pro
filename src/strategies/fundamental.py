@@ -11,6 +11,8 @@ class FundamentalMiner:
         self._spot_cache_ts = 0.0
         self._spot_cache_ttl_sec = spot_cache_ttl_sec
         self._spot_retry = spot_retry
+        self._industry_cache = {}
+        self._peers_cache = {}
 
     def get_stock_fundamentals(self, symbol):
         """
@@ -156,36 +158,84 @@ class FundamentalMiner:
     # ... (get_industry_peers, _find_val, _to_f 保持不变，直接复用原有的即可) ...
     # 为了完整性，这里简写保留辅助函数结构
     def get_industry_peers(self, symbol):
-        # (复用之前的代码逻辑)
         symbol = str(symbol).strip().zfill(6)
+        if symbol in self._peers_cache:
+            return self._peers_cache[symbol]
+
+        industry = self._industry_cache.get(symbol)
+        # 1) 个股信息接口（可能不稳定）
+        if not industry:
+            try:
+                info_df = ak.stock_individual_info_em(symbol=symbol)
+                if info_df is not None and not info_df.empty and "item" in info_df.columns:
+                    row = info_df[info_df["item"].astype(str).str.contains("行业|所属行业")]
+                    if not row.empty:
+                        industry = str(row["value"].values[0]).strip()
+            except Exception:
+                industry = None
+
+        # 2) 使用缓存的全市场spot兜底
+        dummy = {"_err": []}
+        spot_df = self._get_spot_df_cached(dummy)
+        if not industry and spot_df is not None and not spot_df.empty:
+            code_col = next((c for c in spot_df.columns if '代码' in c), None)
+            ind_col = next((c for c in spot_df.columns if '行业' in c), None)
+            if code_col and ind_col:
+                row = spot_df[spot_df[code_col].astype(str).str.zfill(6) == symbol]
+                if not row.empty:
+                    industry = str(row[ind_col].values[0]).strip()
+
+        # 3) 最后兜底：板块按代码前缀
+        if not industry:
+            prefix = symbol[:2]
+            industry = {"60": "上海主板", "00": "深圳主板", "30": "创业板", "68": "科创板"}.get(prefix, "未知")
+
+        # 4) 构建同行对比
         try:
-            info_df = ak.stock_individual_info_em(symbol=symbol)
-            industry = info_df[info_df['item'] == '行业']['value'].values[0]
-            full_market = ak.stock_zh_a_spot_em()
-
-            if '行业' in full_market.columns:
-                peers_df = full_market[full_market['行业'] == industry].copy()
+            if spot_df is None or spot_df.empty:
+                full_market = ak.stock_zh_a_spot_em()
             else:
-                industry_cons = ak.stock_board_industry_cons_em(symbol=industry)
-                peer_codes = industry_cons['代码'].astype(str).str.zfill(6).tolist()
-                full_market['代码'] = full_market['代码'].astype(str).str.zfill(6)
-                peers_df = full_market[full_market['代码'].isin(peer_codes)].copy()
+                full_market = spot_df.copy()
 
-            mkt_cap_col = [c for c in peers_df.columns if '市值' in c][0]
-            peers_df = peers_df.sort_values(by=mkt_cap_col, ascending=False).head(6).copy()
+            code_col = next((c for c in full_market.columns if '代码' in c), None)
+            name_col = next((c for c in full_market.columns if '名称' in c), None)
+            ind_col = next((c for c in full_market.columns if '行业' in c), None)
+            mkt_cap_col = next((c for c in full_market.columns if '总市值' in c), None) or next((c for c in full_market.columns if '市值' in c), None)
+            pe_col = next((c for c in full_market.columns if '市盈率' in c and '动' in c), None) or next((c for c in full_market.columns if '市盈率' in c), None)
+            pb_col = next((c for c in full_market.columns if '市净率' in c), None)
+
+            if code_col:
+                full_market[code_col] = full_market[code_col].astype(str).str.zfill(6)
+
+            if ind_col and industry not in ["未知", "上海主板", "深圳主板", "创业板", "科创板"]:
+                peers_df = full_market[full_market[ind_col] == industry].copy()
+            else:
+                # 使用板块前缀兜底
+                peers_df = full_market[full_market[code_col].astype(str).str.startswith(symbol[:2])].copy()
+
+            if peers_df.empty:
+                return industry, pd.DataFrame()
+
+            if mkt_cap_col:
+                peers_df = peers_df.sort_values(by=mkt_cap_col, ascending=False).head(6).copy()
+            else:
+                peers_df = peers_df.head(6).copy()
 
             comparison_df = pd.DataFrame({
-                "代码": peers_df['代码'].astype(str).str.zfill(6),
-                "名称": peers_df['名称'],
-                "PE(动)": peers_df['市盈率-动态'].apply(self._to_f),
-                "PB": peers_df['市净率'].apply(self._to_f),
-                "市值(亿)": (peers_df[mkt_cap_col].apply(self._to_f) / 100000000).round(2)
+                "代码": peers_df[code_col].astype(str).str.zfill(6) if code_col else peers_df.index.astype(str),
+                "名称": peers_df[name_col] if name_col else "",
+                "PE(动)": peers_df[pe_col].apply(self._to_f) if pe_col else 0.0,
+                "PB": peers_df[pb_col].apply(self._to_f) if pb_col else 0.0,
+                "市值(亿)": (peers_df[mkt_cap_col].apply(self._to_f) / 100000000).round(2) if mkt_cap_col else 0.0
             })
             comparison_df['ROE(推算%)'] = np.where(comparison_df['PE(动)'] > 0,
                                                    (comparison_df['PB'] / comparison_df['PE(动)'] * 100).round(2), 0)
+
+            self._industry_cache[symbol] = industry
+            self._peers_cache[symbol] = (industry, comparison_df)
             return industry, comparison_df
-        except:
-            return "未知", pd.DataFrame()
+        except Exception:
+            return industry or "未知", pd.DataFrame()
 
     def _find_val(self, row, cols, keywords):
         for c in cols:

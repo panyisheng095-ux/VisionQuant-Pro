@@ -1,6 +1,6 @@
 """VisionQuant Pro - 工业级精简版"""
 import streamlit as st
-import os, sys, pandas as pd, numpy as np, mplfinance as mpf, plotly.graph_objects as go
+import os, sys, glob, pandas as pd, numpy as np, mplfinance as mpf, plotly.graph_objects as go
 from datetime import datetime
 import importlib
 import logging
@@ -39,6 +39,21 @@ def _code_version_key():
     ]
     return "|".join([str(os.path.getmtime(p)) if os.path.exists(p) else "0" for p in paths])
 
+def _find_existing_kline_image(symbol: str, date_str: str):
+    img_base = os.path.join(PROJECT_ROOT, "data", "images")
+    date_n = str(date_str).replace("-", "")
+    candidates = [
+        os.path.join(img_base, f"{symbol}_{date_n}.png"),
+        os.path.join(img_base, symbol, f"{symbol}_{date_n}.png"),
+        os.path.join(img_base, symbol, f"{date_n}.png"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    pattern = os.path.join(img_base, "**", f"*{symbol}*{date_n}*.png")
+    matches = glob.glob(pattern, recursive=True)
+    return matches[0] if matches else None
+
 st.set_page_config(page_title="VisionQuant Pro", layout="wide", page_icon="🦄")
 st.markdown("""
     <style>
@@ -74,7 +89,13 @@ if "portfolio_weights" not in st.session_state: st.session_state.portfolio_weigh
 if "portfolio_metrics" not in st.session_state: st.session_state.portfolio_metrics = {}
 if "current_symbol" not in st.session_state: st.session_state.current_symbol = None
 
-from backtest_handlers import run_backtest
+# URL 跳转预处理：先写入 session_state，让侧边栏控件同步
+url_symbol = st.query_params.get("symbol")
+if url_symbol:
+    st.session_state["symbol_input"] = url_symbol
+    st.session_state["mode_select"] = "🔍 单只股票分析"
+
+from backtest_handlers import run_backtest, run_stratified_backtest_batch
 from factor_analysis_handlers import show_factor_analysis as render_factor_analysis
 from streamlit_mic_recorder import mic_recorder
 
@@ -82,9 +103,9 @@ with st.sidebar:
     st.title("🦄 VisionQuant Pro")
     st.caption("AI 全栈量化投研系统 v8.8")
     st.divider()
-    symbol_input = st.text_input("请输入 A 股代码", value="601899", help="输入6位代码")
+    symbol_input = st.text_input("请输入 A 股代码", value="601899", help="输入6位代码", key="symbol_input")
     symbol = symbol_input.strip().zfill(6)
-    mode = st.radio("功能模块:", ("🔍 单只股票分析", "📊 批量组合分析"))
+    mode = st.radio("功能模块:", ("🔍 单只股票分析", "📊 批量组合分析"), key="mode_select")
     
     if mode == "🔍 单只股票分析":
         st.divider()
@@ -100,13 +121,14 @@ with st.sidebar:
         st.cache_resource.clear()
         st.rerun()
 
-url_symbol = st.query_params.get("symbol")
 url_jump_mode = False
 if url_symbol:
     if url_symbol != symbol:
         symbol = url_symbol
         url_jump_mode = True
         mode = "🔍 单只股票分析"
+        st.session_state["symbol_input"] = symbol
+        st.session_state["mode_select"] = "🔍 单只股票分析"
         if "res" in st.session_state:
             del st.session_state.res
         st.session_state.current_symbol = symbol
@@ -115,6 +137,7 @@ if url_symbol:
     elif "res" not in st.session_state:
         url_jump_mode = True
         mode = "🔍 单只股票分析"
+        st.session_state["mode_select"] = "🔍 单只股票分析"
         st.session_state.has_run = True
         run_btn = True
     else:
@@ -155,16 +178,37 @@ if mode == "🔍 单只股票分析":
                 st.error(f"数据获取失败: {str(e)}")
                 st.stop()
 
+            # 数据质量报告
+            try:
+                quality_report = eng["loader"].quality_checker.check_data_quality(df, symbol)
+            except Exception:
+                quality_report = {}
+
             fund_data = eng["fund"].get_stock_fundamentals(symbol)
             stock_name = fund_data.get('name', symbol)
 
-            q_p = os.path.join(PROJECT_ROOT, "data", "temp_q.png")
-            mc = mpf.make_marketcolors(up='red', down='green', inherit=True)
-            s = mpf.make_mpf_style(marketcolors=mc, gridstyle='')
-            mpf.plot(df.tail(20), type='candle', style=s, savefig=dict(fname=q_p, dpi=50), figsize=(3, 3), axisoff=True)
+            # 优先使用已存在的历史K线图（保证与索引同分布）
+            date_str = df.index[-1].strftime("%Y%m%d")
+            q_p = _find_existing_kline_image(symbol, date_str)
+            if not q_p:
+                q_p = os.path.join(PROJECT_ROOT, "data", "temp_q.png")
+                mc = mpf.make_marketcolors(up='red', down='green', inherit=True)
+                s = mpf.make_mpf_style(marketcolors=mc, gridstyle='')
+                mpf.plot(df.tail(20), type='candle', style=s, savefig=dict(fname=q_p, dpi=50), figsize=(3, 3), axisoff=True)
             
             query_prices = df.tail(20)['Close'].values if len(df) >= 20 else None
-            matches = eng["vision"].search_similar_patterns(q_p, top_k=10, query_prices=query_prices)
+            # 多尺度检索（日/周/月）
+            try:
+                from src.data.multi_scale_generator import MultiScaleChartGenerator
+                gen = MultiScaleChartGenerator(figsize=(3, 3), dpi=50)
+                q_week = os.path.join(PROJECT_ROOT, "data", "temp_q_week.png")
+                q_month = os.path.join(PROJECT_ROOT, "data", "temp_q_month.png")
+                gen.generate_weekly_chart(df, weeks=20, output_path=q_week)
+                gen.generate_monthly_chart(df, months=20, output_path=q_month)
+                img_paths = {"daily": q_p, "weekly": q_week, "monthly": q_month}
+                matches = eng["vision"].search_multi_scale_patterns(img_paths, top_k=10, query_prices=query_prices)
+            except Exception:
+                matches = eng["vision"].search_similar_patterns(q_p, top_k=10, query_prices=query_prices)
 
             def get_future_trajectories(matches, loader):
                 trajectories, details = [], []
@@ -192,6 +236,15 @@ if mode == "🔍 单只股票分析":
                 traditional_win_rate = np.sum(np.vstack(trajs)[:, -1] > 0) / len(trajs) * 100
             else:
                 mean_path, avg_ret, traditional_win_rate = np.zeros(6), 0.0, 50.0
+
+            # Top10多期收益/分布估计
+            try:
+                from src.utils.top10_analyzer import Top10Analyzer
+                analyzer = Top10Analyzer(eng["loader"])
+                mh_stats = analyzer.analyze_multi_horizon(matches, horizons=[5, 10, 20])
+                dist_stats = analyzer.return_distribution(matches, future_days=20)
+            except Exception:
+                mh_stats, dist_stats = {}, {}
 
             try:
                 kline_factor_calc = KLineFactorCalculator(data_loader=eng["loader"])
@@ -245,7 +298,10 @@ if mode == "🔍 单只股票分析":
                 "win": win_rate, "ret": avg_ret, "labels": traj_labels,
                 "score": total_score, "act": initial_action, "det": s_details,
                 "fund": fund_data, "df_f": df_f, "ind": ind_name, "peers": peers_df,
-                "news": news_text, "rep": report
+                "news": news_text, "rep": report,
+                "mh_stats": mh_stats, "dist_stats": dist_stats,
+                "matches": matches, "q_p": q_p,
+                "quality_report": quality_report
             }
             
             if hybrid_win_rate_result and hybrid_win_rate is not None:
@@ -297,7 +353,66 @@ if mode == "🔍 单只股票分析":
             - 匹配结果包含：股票代码、日期、相似度分数
             - 计算这些历史模式的未来表现作为预测依据
             """)
+        if d.get("quality_report"):
+            with st.expander("🧪 数据质量报告", expanded=False):
+                qr = d["quality_report"]
+                st.write(f"质量评分: {qr.get('score', 'N/A')}")
+                st.write(f"样本量: {qr.get('data_points', 'N/A')}")
+                st.write(f"时间范围: {qr.get('date_range', {}).get('start')} ~ {qr.get('date_range', {}).get('end')}")
+                if qr.get("missing_stats"):
+                    st.write(f"缺失率: {qr['missing_stats'].get('missing_ratio', 0)*100:.2f}%")
+                    by_col = qr["missing_stats"].get("by_column", {})
+                    if by_col:
+                        fig_miss = go.Figure()
+                        fig_miss.add_trace(go.Bar(x=list(by_col.keys()), y=list(by_col.values())))
+                        fig_miss.update_layout(height=250, title="缺失值分布")
+                        st.plotly_chart(fig_miss, use_container_width=True)
+                if qr.get("adjust_integrity"):
+                    adj = qr["adjust_integrity"]
+                    if adj.get("available"):
+                        st.write(f"复权完整性: {adj.get('column')} 缺失率 {adj.get('missing_ratio', 0)*100:.2f}%")
+                    else:
+                        st.write("复权完整性: 未提供复权列")
+                if qr.get("warnings"):
+                    st.write("警告: " + "; ".join(qr.get("warnings", [])[:5]))
         st.image(d['c_p'], use_container_width=True)
+
+        # 相似度分解（视觉相似度/相关性）
+        if d.get("matches"):
+            rows = []
+            for m in d["matches"]:
+                vector_score = m.get("vector_score")
+                corr = m.get("correlation")
+                sim_score = m.get("sim_score")
+                if sim_score is None:
+                    if vector_score is not None:
+                        sim_score = 1.0 / (1.0 + max(float(vector_score), 0.0))
+                    else:
+                        sim_score = m.get("score", 0)
+                corr_norm = None if corr is None else (float(corr) + 1.0) / 2.0
+                pix_sim = m.get("pixel_sim")
+                rows.append({
+                    "股票": f"{m.get('symbol')}",
+                    "日期": f"{m.get('date')}",
+                    "相似度": round(float(sim_score), 4),
+                    "像素相似": "N/A" if pix_sim is None else round(float(pix_sim), 4),
+                    "相关性": "N/A" if corr_norm is None else round(float(corr_norm), 4),
+                    "最终分": round(float(m.get("score", 0)), 4)
+                })
+            with st.expander("🔍 相似度分解（可解释）", expanded=False):
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        # 注意力热力图（如果模型支持）
+        try:
+            heat_path = os.path.join(PROJECT_ROOT, "data", "temp_attention.png")
+            heat = eng["vision"].generate_attention_heatmap(d.get("q_p"), save_path=heat_path)
+            if heat:
+                with st.expander("🔥 注意力热力图（解释性）", expanded=False):
+                    st.image(heat_path, use_container_width=True)
+                if os.path.exists(heat_path):
+                    os.remove(heat_path)
+        except Exception:
+            pass
         if d['trajs']:
             fig = go.Figure()
             for i, p in enumerate(d['trajs']):
@@ -323,6 +438,29 @@ if mode == "🔍 单只股票分析":
                         """)
                         if 'tb_win_rate' in d:
                             st.caption(f"TB胜率: {d.get('tb_win_rate', 0):.1f}% | 传统胜率: {d.get('traditional_win_rate', 0):.1f}%")
+
+            # 多期收益曲线（5/10/20）
+            mh = d.get("mh_stats", {})
+            if mh.get("valid") and mh.get("horizon_stats"):
+                hs = mh["horizon_stats"]
+                mh_fig = go.Figure()
+                for h, stats in hs.items():
+                    mh_fig.add_trace(go.Scatter(
+                        x=[h], y=[stats.get("avg_return", 0)],
+                        mode="markers+text", text=[f"{h}日"],
+                        name=f"{h}日"
+                    ))
+                mh_fig.update_layout(title="多期收益预期（5/10/20日）", xaxis_title="持有期(天)", yaxis_title="均值收益(%)", height=280)
+                st.plotly_chart(mh_fig, use_container_width=True)
+
+            # 收益分布估计
+            dist = d.get("dist_stats", {})
+            if dist.get("valid"):
+                with st.expander("📊 收益分布估计（更严格）", expanded=False):
+                    st.write(f"样本数: {dist.get('count')}")
+                    st.write(f"均值: {dist.get('mean'):.2f}% | 中位数: {dist.get('median'):.2f}%")
+                    st.write(f"分位数: Q05={dist.get('q05'):.2f}%, Q25={dist.get('q25'):.2f}%, Q75={dist.get('q75'):.2f}%")
+                    st.write(f"CVaR(5%): {dist.get('cvar'):.2f}%")
 
         st.divider()
         c_left, c_right = st.columns([1.5, 1])
@@ -354,6 +492,35 @@ if mode == "🔍 单只股票分析":
                 with col_b:
                     st.write("**技术因子**")
                     st.json(d['det'])
+
+            # 解释性评分（V/F/Q贡献）
+            det = d.get("det", {})
+            try:
+                v = float(det.get("视觉分(V)", 0))
+                f = float(det.get("财务分(F)", 0))
+                q = float(det.get("量化分(Q)", 0))
+                total = v + f + q if (v + f + q) > 0 else 1.0
+                contrib = pd.DataFrame([
+                    {"因子": "视觉(V)", "贡献": f"{v/total*100:.1f}%"},
+                    {"因子": "基本面(F)", "贡献": f"{f/total*100:.1f}%"},
+                    {"因子": "技术(Q)", "贡献": f"{q/total*100:.1f}%"},
+                ])
+                with st.expander("🧠 可解释性评分贡献", expanded=False):
+                    st.dataframe(contrib, use_container_width=True, hide_index=True)
+            except Exception:
+                pass
+
+            # 收益归因（视觉/技术/基本面）
+            try:
+                attribution = pd.DataFrame([
+                    {"来源": "视觉因子", "影响": round(v, 2)},
+                    {"来源": "技术因子", "影响": round(q, 2)},
+                    {"来源": "基本面因子", "影响": round(f, 2)},
+                ])
+                with st.expander("📌 收益归因（因子贡献）", expanded=False):
+                    st.dataframe(attribution, use_container_width=True, hide_index=True)
+            except Exception:
+                pass
 
         with c_right:
             st.subheader(f"3. 行业对标 ({d['ind']})")
@@ -551,6 +718,8 @@ elif mode == "📊 批量组合分析":
                 del st.session_state.res
             st.session_state.current_symbol = None
             st.session_state.has_run = False
+            st.session_state["symbol_input"] = sym
+            st.session_state["mode_select"] = "🔍 单只股票分析"
             st.query_params.update({"symbol": sym, "mode": "detail"})
             st.rerun()
 
@@ -612,6 +781,46 @@ elif mode == "📊 批量组合分析":
 
         if combined_weights:
             st.subheader("📊 组合权重图表")
+            # 拥挤交易指标
+            hhi = sum([w**2 for w in combined_weights.values()])
+            top3 = sum(sorted(combined_weights.values(), reverse=True)[:3])
+            st.caption(f"拥挤度(HHI): {hhi:.4f} | 前三集中度: {top3*100:.1f}%")
+            
+            # 组合指标与风险预算
+            try:
+                metrics = portfolio_optimizer.calculate_portfolio_metrics(combined_weights, batch_results, eng["loader"])
+                if metrics:
+                    st.subheader("🧾 组合风险指标")
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("期望收益", f"{metrics.get('expected_return', 0):.2f}%")
+                    m2.metric("风险(波动)", f"{metrics.get('risk', 0):.2f}%")
+                    m3.metric("Sharpe", f"{metrics.get('sharpe_ratio', 0):.2f}")
+                    m4.metric("CVaR(5%)", f"{metrics.get('cvar', 0):.2f}%")
+                    if metrics.get("risk_budget"):
+                        with st.expander("风险预算分解", expanded=False):
+                            rb = pd.DataFrame(
+                                [{"symbol": k, "risk_contrib": v} for k, v in metrics["risk_budget"].items()]
+                            )
+                            st.dataframe(rb, use_container_width=True, hide_index=True)
+            except Exception:
+                pass
+
+            # 再平衡建议（基于上次权重 + 换手上限）
+            prev_weights = st.session_state.get("portfolio_weights", {})
+            try:
+                rebalance_weights, rebalance_info = portfolio_optimizer.propose_rebalance(
+                    prev_weights, combined_weights, max_turnover=0.20
+                )
+                st.session_state.portfolio_weights = combined_weights
+                with st.expander("🔁 再平衡建议（换手≤20%）", expanded=False):
+                    st.write(f"预计换手: {rebalance_info.get('turnover', 0)*100:.1f}%")
+                    r_df = pd.DataFrame([
+                        {"symbol": s, "current": round(prev_weights.get(s, 0)*100, 1), "target": round(rebalance_weights.get(s, 0)*100, 1)}
+                        for s in set(prev_weights) | set(rebalance_weights)
+                    ])
+                    st.dataframe(r_df, use_container_width=True, hide_index=True)
+            except Exception:
+                pass
             labels = [f"{batch_results[s].get('name', s)}({s})" for s in combined_weights.keys()]
             values = [combined_weights[s] for s in combined_weights.keys()]
             pie = go.Figure(data=[go.Pie(labels=labels, values=values, hole=0.35)])
@@ -657,6 +866,70 @@ elif mode == "📊 批量组合分析":
                             os.remove(tmp_img)
                     except Exception:
                         continue
+
+            # 分层回测（行业/市值/风格 + 显著性）
+            with st.expander("🧪 分层回测（行业/市值/风格）", expanded=False):
+                if st.button("运行分层回测", key="strat_bt_btn"):
+                    strat_df = run_stratified_backtest_batch(list(batch_results.keys()), eng)
+                    if strat_df is not None and not strat_df.empty:
+                        st.dataframe(strat_df, use_container_width=True, hide_index=True)
+                    else:
+                        st.info("分层样本不足或数据不可用")
+
+            # 权重动态变化（简化：基于20日动量的月度再平衡）
+            try:
+                st.subheader("📈 组合权重动态变化")
+                top_syms = list(combined_weights.keys())[:6]
+                weight_df = pd.DataFrame()
+                for sym in top_syms:
+                    dfw = eng["loader"].get_stock_data(sym)
+                    if dfw is None or dfw.empty:
+                        continue
+                    dfw.index = pd.to_datetime(dfw.index)
+                    dfw = dfw.tail(180)
+                    mom = dfw["Close"].pct_change(20)
+                    dfw = dfw.assign(mom=mom)
+                    dfw = dfw.resample("M").last().dropna()
+                    weight_df[sym] = dfw["mom"]
+                if not weight_df.empty:
+                    # 归一化为权重
+                    weight_df = weight_df.apply(lambda x: x - x.min() + 1e-6)
+                    weight_df = weight_df.div(weight_df.sum(axis=1), axis=0)
+                    fig_w = go.Figure()
+                    for sym in weight_df.columns:
+                        fig_w.add_trace(go.Scatter(x=weight_df.index, y=weight_df[sym], mode="lines", name=sym))
+                    fig_w.update_layout(height=320, title="月度权重演化（动量驱动）")
+                    st.plotly_chart(fig_w, use_container_width=True)
+            except Exception:
+                pass
+
+            # 滚动收益热图
+            try:
+                st.subheader("🧊 滚动收益热图（20日）")
+                heat_syms = list(combined_weights.keys())[:8]
+                heat_data = []
+                heat_index = None
+                for sym in heat_syms:
+                    dfh = eng["loader"].get_stock_data(sym)
+                    if dfh is None or dfh.empty:
+                        continue
+                    dfh.index = pd.to_datetime(dfh.index)
+                    dfh = dfh.tail(200)
+                    roll = dfh["Close"].pct_change(20) * 100
+                    if heat_index is None:
+                        heat_index = roll.index
+                    heat_data.append(roll.reindex(heat_index).fillna(0).values)
+                if heat_data:
+                    heat = go.Figure(data=go.Heatmap(
+                        z=np.array(heat_data),
+                        x=[d.strftime("%Y-%m-%d") for d in heat_index],
+                        y=heat_syms,
+                        colorscale="RdYlGn"
+                    ))
+                    heat.update_layout(height=320)
+                    st.plotly_chart(heat, use_container_width=True)
+            except Exception:
+                pass
         
         if wait_stocks or sell_stocks:
             st.divider()
@@ -668,12 +941,7 @@ elif mode == "📊 批量组合分析":
                     with col1:
                         if st.button(f"📊 {data.get('name', symbol)} ({symbol})", 
                                    key=f"link_other_{symbol}", use_container_width=True):
-                            if "res" in st.session_state:
-                                del st.session_state.res
-                            st.session_state.current_symbol = None
-                            st.session_state.has_run = False
-                            st.query_params.update({"symbol": symbol, "mode": "detail"})
-                            st.rerun()
+                            _goto_symbol(symbol)
                     with col2:
                         st.write(f"**{data.get('score', 0):.1f}/10**")
                     with col3:

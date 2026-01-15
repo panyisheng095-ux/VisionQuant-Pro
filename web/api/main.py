@@ -1,7 +1,9 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from datetime import datetime
 import pandas as pd
+import os
+import time
 
 from src.data.data_loader import DataLoader
 from src.strategies.kline_factor import KLineFactorCalculator
@@ -13,6 +15,23 @@ app = FastAPI(
     description="K线视觉学习因子投研服务（轻量版）",
     version="2.1.0",
 )
+
+# 简单审计日志
+LOG_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "api_access.log")
+
+@app.middleware("http")
+async def audit_log(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    cost = (time.time() - start) * 1000
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(f"{datetime.now().isoformat()} {request.method} {request.url.path} {response.status_code} {cost:.1f}ms\n")
+    except Exception:
+        pass
+    return response
 
 
 class SingleStockRequest(BaseModel):

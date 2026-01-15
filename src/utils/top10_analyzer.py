@@ -166,6 +166,81 @@ class Top10Analyzer:
             result['sharpe_like'] = 0
         
         return result
+
+    def analyze_multi_horizon(
+        self,
+        matches: List[Dict],
+        horizons: List[int] = None
+    ) -> Dict:
+        """
+        多期收益统计（5/10/20天）
+        """
+        if horizons is None:
+            horizons = [5, 10, 20]
+        result = {"valid": False}
+        if not matches or not self.data_loader:
+            return result
+
+        horizon_stats = {}
+        for h in horizons:
+            stats = self.analyze_matches(matches, future_days=h)
+            horizon_stats[h] = {
+                "avg_return": stats.get("avg_return", 0),
+                "median_return": stats.get("median_return", 0),
+                "win_rate": stats.get("win_rate", 0),
+                "max_drawdown": stats.get("avg_max_drawdown", 0)
+            }
+        result["valid"] = True
+        result["horizon_stats"] = horizon_stats
+        return result
+
+    def return_distribution(
+        self,
+        matches: List[Dict],
+        future_days: int = 20
+    ) -> Dict:
+        """
+        收益分布估计：均值/中位数/分位数/CVaR
+        """
+        stats = self.analyze_matches(matches, future_days=future_days)
+        if not stats.get("valid"):
+            return {"valid": False}
+        returns = stats.get("returns_raw") if "returns_raw" in stats else None
+        if returns is None:
+            # 兼容旧结构：重新计算
+            returns = []
+            for m in matches:
+                symbol = str(m.get("symbol", "")).zfill(6)
+                date_str = str(m.get("date", ""))
+                try:
+                    match_date = datetime.strptime(date_str, "%Y-%m-%d") if "-" in date_str else datetime.strptime(date_str, "%Y%m%d")
+                    df = self.data_loader.get_stock_data(symbol)
+                    if df is None or df.empty:
+                        continue
+                    df.index = pd.to_datetime(df.index)
+                    if match_date in df.index:
+                        loc = df.index.get_loc(match_date)
+                        if loc + future_days < len(df):
+                            entry = df.iloc[loc]["Close"]
+                            future = df.iloc[loc + future_days]["Close"]
+                            returns.append((future - entry) / entry * 100)
+                except Exception:
+                    continue
+        if not returns:
+            return {"valid": False}
+        s = pd.Series(returns)
+        q05 = float(s.quantile(0.05))
+        cvar = float(s[s <= q05].mean()) if (s <= q05).any() else q05
+        return {
+            "valid": True,
+            "mean": float(s.mean()),
+            "median": float(s.median()),
+            "q05": q05,
+            "q25": float(s.quantile(0.25)),
+            "q75": float(s.quantile(0.75)),
+            "cvar": cvar,
+            "count": int(len(s))
+        }
     
     def get_return_trajectories(
         self,

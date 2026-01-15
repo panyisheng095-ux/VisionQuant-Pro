@@ -107,6 +107,7 @@ class DataQualityChecker:
             'errors': errors,
             'warnings': warnings,
             'missing_stats': missing_stats,
+            'adjust_integrity': self._check_adjust_integrity(df),
             'data_points': len(df),
             'date_range': {
                 'start': str(df.index[0]) if len(df) > 0 else None,
@@ -222,6 +223,15 @@ class DataQualityChecker:
             warnings.append(f"存在异常大的时间间隔(>10天): {len(large_gaps)}个（可能是停牌）")
         
         return warnings
+
+    def _check_adjust_integrity(self, df: pd.DataFrame) -> Dict:
+        """检查复权完整性（若有Adj Close/复权列）"""
+        adj_cols = [c for c in df.columns if 'Adj' in str(c) or '复权' in str(c)]
+        if not adj_cols:
+            return {'available': False, 'missing_ratio': None, 'column': None}
+        col = adj_cols[0]
+        missing = df[col].isna().mean() if len(df) > 0 else 1.0
+        return {'available': True, 'missing_ratio': float(missing), 'column': col}
     
     def _check_outliers(self, df: pd.DataFrame) -> List[str]:
         """检查异常值（使用IQR方法）"""
