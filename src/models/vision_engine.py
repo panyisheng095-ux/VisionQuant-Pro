@@ -402,7 +402,7 @@ class VisionEngine:
         # 返回Top-K
         return candidates[:top_k]
 
-    def generate_attention_heatmap(self, img_path, save_path=None):
+    def generate_attention_heatmap(self, img_path, save_path=None, head_idx: int = 0, mode: str = "single"):
         """
         生成注意力热力图（如果模型支持注意力权重）
         """
@@ -414,9 +414,14 @@ class VisionEngine:
             img = Image.open(img_path).convert('RGB')
             input_tensor = self.preprocess(img)
             visualizer = AttentionVisualizer(self.model, device=str(self.device))
-            fig = visualizer.visualize_single_attention(
-                input_tensor, head_idx=0, query_pos=(7, 7), save_path=save_path
-            )
+            if mode == "all":
+                fig = visualizer.visualize_multi_head_attention(
+                    input_tensor, query_pos=(7, 7), save_path=save_path
+                )
+            else:
+                fig = visualizer.visualize_single_attention(
+                    input_tensor, head_idx=head_idx, query_pos=(7, 7), save_path=save_path
+                )
             return save_path
         except Exception:
             return None

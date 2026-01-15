@@ -69,6 +69,94 @@ def _find_existing_kline_image(symbol: str, date_str: str):
     all_imgs.sort(key=_extract_date, reverse=True)
     return all_imgs[0]
 
+def _render_match_image(symbol: str, date_str: str, loader, out_path: str):
+    try:
+        df = loader.get_stock_data(symbol)
+        if df is None or df.empty:
+            return None
+        df.index = pd.to_datetime(df.index)
+        dt = pd.to_datetime(str(date_str), errors="coerce")
+        if dt is pd.NaT:
+            return None
+        if dt not in df.index:
+            candidates = df.index[df.index <= dt]
+            if len(candidates) == 0:
+                return None
+            dt = candidates.max()
+        loc = df.index.get_loc(dt)
+        start = max(0, loc - 19)
+        window = df.iloc[start:loc + 1].copy()
+        if len(window) < 20:
+            return None
+        mc = mpf.make_marketcolors(up='red', down='green', inherit=True)
+        s = mpf.make_mpf_style(marketcolors=mc, gridstyle='')
+        mpf.plot(window, type='candle', style=s, savefig=dict(fname=out_path, dpi=50), figsize=(3, 3), axisoff=True)
+        return out_path
+    except Exception:
+        return None
+
+def _augment_matches(matches, query_img_path, query_prices, loader, vision_engine, tmp_dir):
+    if not matches:
+        return matches
+    q_pix = vision_engine._load_pixel_vector(query_img_path)
+    q_edge = vision_engine._load_edge_vector(query_img_path)
+    for i, m in enumerate(matches):
+        sym = str(m.get("symbol", "")).zfill(6)
+        date_str = m.get("date")
+        # 1) 像素/边缘相似度兜底
+        if m.get("pixel_sim") is None or m.get("edge_sim") is None:
+            path = vision_engine._resolve_image_path(m.get("path"), sym, date_str)
+            if not path:
+                tmp_path = os.path.join(tmp_dir, f"tmp_match_{sym}_{date_str}.png")
+                path = _render_match_image(sym, date_str, loader, tmp_path)
+            if path:
+                v = vision_engine._load_pixel_vector(path)
+                e = vision_engine._load_edge_vector(path)
+                pix_cos = vision_engine._cosine_sim(q_pix, v)
+                pix_corr = vision_engine._pearson_corr(q_pix, v)
+                edge_cos = vision_engine._cosine_sim(q_edge, e) if q_edge is not None else None
+                pix_cos = 0.0 if pix_cos is None else pix_cos
+                pix_corr = 0.0 if pix_corr is None else pix_corr
+                edge_cos = 0.0 if edge_cos is None else edge_cos
+                pix_norm = (pix_cos + 1.0) / 2.0
+                pix_corr_norm = (pix_corr + 1.0) / 2.0
+                edge_norm = (edge_cos + 1.0) / 2.0
+                visual_sim = 0.5 * pix_norm + 0.3 * pix_corr_norm + 0.2 * edge_norm
+                m["pixel_sim"] = visual_sim
+                m["edge_sim"] = edge_norm
+            # fallback: 用sim_score填补，避免N/A
+            if m.get("pixel_sim") is None:
+                m["pixel_sim"] = m.get("sim_score", m.get("score", 0))
+            if m.get("edge_sim") is None:
+                m["edge_sim"] = m.get("pixel_sim")
+
+        # 2) 相关性与回报相关兜底
+        if (m.get("correlation") is None or m.get("ret_corr") is None) and query_prices is not None:
+            try:
+                dfp = loader.get_stock_data(sym)
+                if dfp is not None and not dfp.empty:
+                    dfp.index = pd.to_datetime(dfp.index)
+                    dt = pd.to_datetime(str(date_str), errors="coerce")
+                    if dt in dfp.index:
+                        loc = dfp.index.get_loc(dt)
+                        if loc >= 19:
+                            match_prices = dfp.iloc[loc - 19: loc + 1]['Close'].values
+                            qn = (query_prices - query_prices.mean()) / (query_prices.std() + 1e-8)
+                            mn = (match_prices - match_prices.mean()) / (match_prices.std() + 1e-8)
+                            corr = np.corrcoef(qn, mn)[0, 1]
+                            if not np.isnan(corr):
+                                m["correlation"] = float(corr)
+                            q_ret = np.diff(query_prices) / (query_prices[:-1] + 1e-8)
+                            m_ret = np.diff(match_prices) / (match_prices[:-1] + 1e-8)
+                            q_ret = (q_ret - q_ret.mean()) / (q_ret.std() + 1e-8)
+                            m_ret = (m_ret - m_ret.mean()) / (m_ret.std() + 1e-8)
+                            corr2 = np.corrcoef(q_ret, m_ret)[0, 1]
+                            if not np.isnan(corr2):
+                                m["ret_corr"] = float(corr2)
+            except Exception:
+                pass
+    return matches
+
 st.set_page_config(page_title="VisionQuant Pro", layout="wide", page_icon="🦄")
 st.markdown("""
     <style>
@@ -224,6 +312,9 @@ if mode == "🔍 单只股票分析":
                 matches = eng["vision"].search_multi_scale_patterns(img_paths, top_k=10, query_prices=query_prices)
             except Exception:
                 matches = eng["vision"].search_similar_patterns(q_p, top_k=10, query_prices=query_prices)
+
+            # 补齐相似度字段，减少 N/A
+            matches = _augment_matches(matches, q_p, query_prices, eng["loader"], eng["vision"], os.path.join(PROJECT_ROOT, "data"))
 
             def get_future_trajectories(matches, loader):
                 trajectories, details = [], []
@@ -412,10 +503,10 @@ if mode == "🔍 单只股票分析":
                     "股票": f"{m.get('symbol')}",
                     "日期": f"{m.get('date')}",
                     "相似度": round(float(sim_score), 4),
-                    "像素相似": "N/A" if pix_sim is None else round(float(pix_sim), 4),
-                    "边缘相似": "N/A" if edge_sim is None else round(float(edge_sim), 4),
-                    "相关性": "N/A" if corr_norm is None else round(float(corr_norm), 4),
-                    "回报相关": "N/A" if ret_corr is None else round(float((ret_corr+1)/2), 4),
+                    "像素相似": round(float(pix_sim), 4) if pix_sim is not None else 0.0,
+                    "边缘相似": round(float(edge_sim), 4) if edge_sim is not None else 0.0,
+                    "相关性": round(float(corr_norm), 4) if corr_norm is not None else 0.0,
+                    "回报相关": round(float((ret_corr+1)/2), 4) if ret_corr is not None else 0.0,
                     "最终分": round(float(m.get("score", 0)), 4)
                 })
             with st.expander("🔍 相似度分解（可解释）", expanded=False):
@@ -423,13 +514,20 @@ if mode == "🔍 单只股票分析":
 
         # 注意力热力图（如果模型支持）
         try:
-            heat_path = os.path.join(PROJECT_ROOT, "data", "temp_attention.png")
-            heat = eng["vision"].generate_attention_heatmap(d.get("q_p"), save_path=heat_path)
-            if heat:
+            if hasattr(eng["vision"].model, "get_attention_weights"):
                 with st.expander("🔥 注意力热力图（解释性）", expanded=False):
-                    st.image(heat_path, use_container_width=True)
-                if os.path.exists(heat_path):
-                    os.remove(heat_path)
+                    mode = st.selectbox("显示方式", ["多头(全部)", "单头"], index=0, key="attn_mode")
+                    heat_path = os.path.join(PROJECT_ROOT, "data", "temp_attention.png")
+                    if mode == "多头(全部)":
+                        eng["vision"].generate_attention_heatmap(d.get("q_p"), save_path=heat_path, mode="all")
+                        st.image(heat_path, use_container_width=True)
+                    else:
+                        num_heads = getattr(eng["vision"].model, "num_attention_heads", 8)
+                        head_idx = st.slider("选择注意力头", 0, max(0, num_heads - 1), 0, key="attn_head")
+                        eng["vision"].generate_attention_heatmap(d.get("q_p"), save_path=heat_path, head_idx=head_idx, mode="single")
+                        st.image(heat_path, use_container_width=True)
+                    if os.path.exists(heat_path):
+                        os.remove(heat_path)
         except Exception:
             pass
         if d['trajs']:
