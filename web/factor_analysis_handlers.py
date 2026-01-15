@@ -52,6 +52,7 @@ def show_factor_analysis(symbol, df_f, eng, PROJECT_ROOT):
         rolling_ic = ic_result.get("ic_series", pd.Series(dtype=float))
 
         _plot_ic_curve(rolling_ic, ic_result)
+        _plot_sharpe_curve(ic_result)
         _plot_regime_distribution(df_f)
         _plot_decay_analysis(rolling_ic)
         _detect_invalidation(factor_series, returns_series)
@@ -154,6 +155,22 @@ def _plot_ic_curve(rolling_ic, ic_result):
     col3.metric("ICIR", f"{ic_ir:.2f}", delta="优秀" if abs(ic_ir) > 1.0 else "一般")
     col4.metric("正IC比例", f"{positive_ratio*100:.1f}%",
                delta="良好" if positive_ratio > 0.6 else "一般")
+
+def _plot_sharpe_curve(ic_result):
+    """绘制Rolling Sharpe曲线"""
+    import streamlit as st
+    sharpe_series = (ic_result or {}).get("sharpe_series", None)
+    if sharpe_series is None or len(sharpe_series) == 0:
+        return
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=sharpe_series.index, y=sharpe_series.values, mode='lines',
+                            name='Rolling Sharpe', line=dict(color='orange', width=2)))
+    fig.update_layout(title="Rolling Sharpe 分析", height=260)
+    st.plotly_chart(fig, config={"displayModeBar": False}, use_container_width=True)
+
+    mean_sharpe = float(getattr(sharpe_series, "mean", lambda: 0.0)())
+    st.caption(f"Rolling Sharpe均值: {mean_sharpe:.3f}")
 
 def _plot_regime_distribution(df_f):
     """绘制Regime分布"""

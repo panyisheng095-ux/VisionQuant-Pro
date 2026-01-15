@@ -215,13 +215,21 @@ class VisionEngine:
                 except Exception:
                     correlation = None
 
-            # === 优化4: 评分策略（保证不空）===
-            # 相关性算不出来：退回纯视觉相似度
+            # === 优化4: 评分策略（相似度校准 + 相关性增强）===
+            # Faiss 距离越小越相似 -> 转为 similarity 分数（0~1）
+            try:
+                dist = float(vector_score)
+                sim_score = 1.0 / (1.0 + max(dist, 0.0))
+            except Exception:
+                sim_score = 0.0
+
             if correlation is None:
-                final_score = float(vector_score)
+                final_score = sim_score
             else:
-                # 相关性作为增强项，提高排序稳定性（但不作为硬过滤条件）
-                final_score = 0.3 * float(vector_score) + 0.7 * float(correlation)
+                # 相关性归一化到 0~1
+                corr_norm = (float(correlation) + 1.0) / 2.0
+                corr_norm = min(max(corr_norm, 0.0), 1.0)
+                final_score = 0.7 * sim_score + 0.3 * corr_norm
 
             candidates.append({
                 "symbol": sym,

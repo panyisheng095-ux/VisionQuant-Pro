@@ -136,8 +136,10 @@ def _run_simple_backtest(df, symbol, bt_cap, bt_ma, bt_stop, bt_vision, eng, PRO
     cost_calc = AdvancedTransactionCost()
     vision_map = _load_vision_map(symbol, PROJECT_ROOT)
     
-    ret, bench_ret, trades, equity = _backtest_loop(df, symbol, bt_cap, bt_ma, bt_stop, 
-                                                    bt_vision, vision_map, cost_calc, return_equity=True)
+    ret, bench_ret, trades, equity, cost_summary = _backtest_loop(
+        df, symbol, bt_cap, bt_ma, bt_stop, bt_vision, vision_map, cost_calc,
+        return_equity=True, return_costs=True
+    )
     
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df.index, y=equity, name="VQ策略", line=dict(color='#ff4b4b', width=2)))
@@ -158,11 +160,33 @@ def _run_simple_backtest(df, symbol, bt_cap, bt_ma, bt_stop, bt_vision, eng, PRO
     except Exception:
         sharpe = np.nan
     
-    col1, col2, col3, col4 = st.columns(4)
+    # 最大回撤（Q2B：15%阈值）
+    try:
+        roll_max = eq.cummax()
+        drawdown = (eq / roll_max - 1.0).min()
+        max_dd = float(drawdown) if pd.notna(drawdown) else 0.0
+    except Exception:
+        max_dd = 0.0
+    
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("策略收益率", f"{ret:.2f}%", delta=f"{alpha:.2f}% vs 基准")
     col2.metric("Alpha", f"{alpha:.2f}%", delta="超额收益" if alpha > 0 else "跑输基准")
     col3.metric("交易次数", f"{trades}次")
     col4.metric("夏普比率", f"{sharpe:.2f}" if np.isfinite(sharpe) else "N/A")
+    col5.metric("最大回撤", f"{max_dd*100:.2f}%")
+    if max_dd <= -0.15:
+        st.warning("⚠️ 最大回撤超过 15%，风险偏高（按你的约束阈值提示）")
+
+    # 多基线对比（Q14D）
+    baseline_df = _compute_baseline_returns(df)
+    if not baseline_df.empty:
+        st.subheader("📊 基线策略对比（多基线）")
+        st.dataframe(baseline_df, use_container_width=True, hide_index=True)
+
+    # Transaction Cost 明细（Q4：ABCD）
+    if cost_summary:
+        with st.expander("💸 交易成本明细", expanded=False):
+            st.json(cost_summary)
 
 def _calc_indicators(df, bt_ma):
     """计算技术指标"""
@@ -189,11 +213,22 @@ def _load_vision_map(symbol, PROJECT_ROOT):
     except:
         return {}
 
-def _backtest_loop(df, symbol, bt_cap, bt_ma, bt_stop, bt_vision, vision_map, cost_calc, return_equity=False):
+def _backtest_loop(df, symbol, bt_cap, bt_ma, bt_stop, bt_vision, vision_map, cost_calc,
+                   return_equity=False, return_costs=False):
     """回测循环核心逻辑"""
     cash, shares, equity = bt_cap, 0, []
     entry_price = 0.0
     max_turnover = 0.20
+    prev_close = None
+    trades_count = 0
+    cost_summary = {
+        "total_cost": 0.0,
+        "commission": 0.0,
+        "slippage": 0.0,
+        "market_impact": 0.0,
+        "opportunity_cost": 0.0,
+        "trade_count": 0
+    }
     
     for _, row in df.iterrows():
         # 先取价格，再用作缺省值（修复 UnboundLocalError: p）
@@ -204,6 +239,14 @@ def _backtest_loop(df, symbol, bt_cap, bt_ma, bt_stop, bt_vision, vision_map, co
         date_str = row.name.strftime("%Y%m%d")
         ai_win = vision_map.get((symbol, date_str), 50.0)
         volume = float(row.get('Volume', df['Close'].mean() * 1000000))
+
+        # A股涨跌停与停牌处理（Q9D）
+        daily_ret = None
+        if prev_close is not None and prev_close > 0:
+            daily_ret = (p - prev_close) / prev_close
+        is_limit_up = daily_ret is not None and daily_ret >= 0.095
+        is_limit_down = daily_ret is not None and daily_ret <= -0.095
+        is_suspended = (not np.isfinite(volume)) or volume <= 0
         
         target_pos = _calc_target_position(p, ma60, ma20, macd, ai_win, bt_vision)
         total_assets = cash + shares * p
@@ -215,6 +258,19 @@ def _backtest_loop(df, symbol, bt_cap, bt_ma, bt_stop, bt_vision, vision_map, co
             diff = max_trade if diff > 0 else -max_trade
         
         if abs(diff * p) > total_assets * 0.1:
+            if is_suspended:
+                equity.append(cash + shares * p)
+                prev_close = p
+                continue
+            if diff > 0 and is_limit_up:
+                equity.append(cash + shares * p)
+                prev_close = p
+                continue
+            if diff < 0 and is_limit_down:
+                equity.append(cash + shares * p)
+                prev_close = p
+                continue
+
             trade_value = abs(diff * p)
             volatility = df['Close'].pct_change().std() if len(df) > 1 else 0.02
             if pd.isna(volatility) or volatility <= 0:
@@ -225,12 +281,14 @@ def _backtest_loop(df, symbol, bt_cap, bt_ma, bt_stop, bt_vision, vision_map, co
                 total_cost = cost_result.get('total_cost', trade_value * 0.001)
             except:
                 total_cost = trade_value * 0.001
+                cost_result = {}
             
             if diff > 0 and cash >= diff * p + total_cost:
                 cash -= diff * p + total_cost
                 shares += diff
                 if entry_price == 0:
                     entry_price = p
+                trades_count += 1
             elif diff < 0:
                 pnl = (p - entry_price) / entry_price if entry_price > 0 and shares > 0 else 0
                 if pnl < -bt_stop / 100:
@@ -239,14 +297,70 @@ def _backtest_loop(df, symbol, bt_cap, bt_ma, bt_stop, bt_vision, vision_map, co
                 shares += diff
                 if shares == 0:
                     entry_price = 0
+                trades_count += 1
+
+            if cost_result:
+                cost_summary["total_cost"] += float(cost_result.get("total_cost", 0))
+                cost_summary["commission"] += float(cost_result.get("commission", 0))
+                cost_summary["slippage"] += float(cost_result.get("slippage", 0))
+                cost_summary["market_impact"] += float(cost_result.get("market_impact", 0))
+                cost_summary["opportunity_cost"] += float(cost_result.get("opportunity_cost", 0))
+                cost_summary["trade_count"] += 1
         
         equity.append(cash + shares * p)
+        prev_close = p
     
     ret = (equity[-1] - bt_cap) / bt_cap * 100 if equity else 0
     bench_ret = (df['Close'].iloc[-1] / df['Close'].iloc[0] - 1) * 100 if len(df) > 0 else 0
-    trades = sum(1 for e in equity if e != equity[0]) if len(equity) > 1 else 0
-    
-    return (ret, bench_ret, trades, equity) if return_equity else (ret, bench_ret, trades)
+    trades = trades_count if trades_count > 0 else (sum(1 for e in equity if e != equity[0]) if len(equity) > 1 else 0)
+
+    if return_equity and return_costs:
+        return ret, bench_ret, trades, equity, cost_summary
+    if return_equity:
+        return ret, bench_ret, trades, equity
+    return (ret, bench_ret, trades)
+
+def _compute_baseline_returns(df):
+    """多基线收益率对比（Q14D）"""
+    try:
+        close = df["Close"].astype(float)
+        returns = close.pct_change().fillna(0.0)
+
+        # Buy & Hold
+        buy_hold = (1.0 + returns).cumprod().iloc[-1] - 1.0
+
+        # MA交叉
+        ma_signal = (df["MA20"] > df["MA60"]).astype(float)
+        ma_ret = (1.0 + returns * ma_signal.shift(1).fillna(0.0)).cumprod().iloc[-1] - 1.0
+
+        # RSI(14)
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / (loss + 1e-8)
+        rsi = 100 - (100 / (1 + rs))
+        rsi_signal = (rsi < 30).astype(float).fillna(0.0)
+        rsi_ret = (1.0 + returns * rsi_signal.shift(1).fillna(0.0)).cumprod().iloc[-1] - 1.0
+
+        # MACD
+        macd_signal = (df["MACD"] > 0).astype(float)
+        macd_ret = (1.0 + returns * macd_signal.shift(1).fillna(0.0)).cumprod().iloc[-1] - 1.0
+
+        # Momentum(20)
+        mom = close.pct_change(20)
+        mom_signal = (mom > 0).astype(float).fillna(0.0)
+        mom_ret = (1.0 + returns * mom_signal.shift(1).fillna(0.0)).cumprod().iloc[-1] - 1.0
+
+        data = [
+            {"基线": "Buy&Hold", "收益率": f"{buy_hold*100:.2f}%"},
+            {"基线": "MA 20/60", "收益率": f"{ma_ret*100:.2f}%"},
+            {"基线": "RSI(14)", "收益率": f"{rsi_ret*100:.2f}%"},
+            {"基线": "MACD>0", "收益率": f"{macd_ret*100:.2f}%"},
+            {"基线": "Momentum(20)", "收益率": f"{mom_ret*100:.2f}%"},
+        ]
+        return pd.DataFrame(data)
+    except Exception:
+        return pd.DataFrame()
 
 def _calc_target_position(p, ma60, ma20, macd, ai_win, bt_vision):
     """计算目标仓位"""

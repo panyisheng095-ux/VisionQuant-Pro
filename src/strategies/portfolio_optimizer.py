@@ -133,14 +133,24 @@ class PortfolioOptimizer:
         if cov_matrix is None or len(cov_matrix) == 0:
             return self._simple_weight_allocation(sorted_stocks, min_weight, max_weight)
         
-        # 马科维茨优化
+        # Black-Litterman 优化（Q10：不选C/D）
         try:
+            bl_returns = self._black_litterman_expected_returns(
+                expected_returns, cov_matrix
+            )
             weights = self._markowitz_optimize(
-                expected_returns, cov_matrix, 
+                bl_returns, cov_matrix,
                 min_weight, max_weight, risk_aversion
             )
-        except:
-            return self._simple_weight_allocation(sorted_stocks, min_weight, max_weight)
+        except Exception:
+            # 回退到 Markowitz
+            try:
+                weights = self._markowitz_optimize(
+                    expected_returns, cov_matrix,
+                    min_weight, max_weight, risk_aversion
+                )
+            except Exception:
+                return self._simple_weight_allocation(sorted_stocks, min_weight, max_weight)
         
         # 构建结果字典
         result = {}
@@ -295,6 +305,38 @@ class PortfolioOptimizer:
         else:
             # 优化失败，返回等权重
             return np.array([1.0 / n] * n)
+
+    def _black_litterman_expected_returns(self, expected_returns, cov_matrix,
+                                          tau: float = 0.05, delta: float = 2.5):
+        """
+        计算 Black-Litterman 融合后的期望收益
+        - 市场均衡收益 pi = delta * Sigma * w_mkt
+        - 观点 Q = expected_returns（来自视觉因子）
+        """
+        n = len(expected_returns)
+        if n == 0:
+            return expected_returns
+
+        # 市场权重（等权）
+        w_mkt = np.array([1.0 / n] * n)
+
+        # 均衡收益
+        pi = delta * cov_matrix.dot(w_mkt)
+
+        # 观点矩阵
+        P = np.eye(n)
+        Q = expected_returns.reshape(-1, 1)
+
+        # Omega（观点不确定性）
+        omega = np.diag(np.diag(P.dot(tau * cov_matrix).dot(P.T)))
+
+        # BL 公式
+        inv_tau_sigma = np.linalg.inv(tau * cov_matrix)
+        inv_omega = np.linalg.inv(omega)
+        middle = np.linalg.inv(inv_tau_sigma + P.T.dot(inv_omega).dot(P))
+        mu_bl = middle.dot(inv_tau_sigma.dot(pi.reshape(-1, 1)) + P.T.dot(inv_omega).dot(Q))
+
+        return mu_bl.flatten()
     
     def _simple_weight_allocation(self, sorted_stocks, min_weight, max_weight):
         """简化权重分配（按评分比例）"""

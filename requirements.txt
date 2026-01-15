@@ -32,6 +32,8 @@ google-generativeai>=0.3.0
 
 # ----- Web界面 -----
 streamlit>=1.28.0
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
 streamlit-mic-recorder>=0.0.8
 
 # ----- 可视化 -----
