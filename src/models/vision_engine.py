@@ -209,6 +209,15 @@ class VisionEngine:
         except Exception:
             return None
 
+    def _parse_date(self, date_str):
+        try:
+            return datetime.strptime(str(date_str), "%Y%m%d")
+        except Exception:
+            try:
+                return datetime.strptime(str(date_str), "%Y-%m-%d")
+            except Exception:
+                return None
+
     def _load_edge_vector(self, img_path, size=(64, 64)):
         """简单边缘特征（像素差分）"""
         if not img_path:
@@ -474,7 +483,30 @@ class VisionEngine:
                     c["edge_sim"] = edge_norm
                     c["score"] = 0.7 * c["score"] + 0.3 * visual_sim
         candidates.sort(key=lambda x: x["score"], reverse=True)
-        return candidates[:top_k]
+
+        # 时间隔离（避免同一股票相邻日期）
+        ISOLATION_DAYS = 20
+        isolated = []
+        seen_dates = {}
+        for c in candidates:
+            sym = str(c.get("symbol", "")).zfill(6)
+            dt = self._parse_date(c.get("date"))
+            if dt is None:
+                continue
+            conflict = False
+            if sym in seen_dates:
+                for d in seen_dates[sym]:
+                    if abs((dt - d).days) < ISOLATION_DAYS:
+                        conflict = True
+                        break
+            if conflict:
+                continue
+            isolated.append(c)
+            seen_dates.setdefault(sym, []).append(dt)
+            if len(isolated) >= top_k:
+                break
+
+        return isolated if isolated else candidates[:top_k]
 
 
 if __name__ == "__main__":
