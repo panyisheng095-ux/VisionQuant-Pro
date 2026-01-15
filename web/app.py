@@ -52,7 +52,22 @@ def _find_existing_kline_image(symbol: str, date_str: str):
             return p
     pattern = os.path.join(img_base, "**", f"*{symbol}*{date_n}*.png")
     matches = glob.glob(pattern, recursive=True)
-    return matches[0] if matches else None
+    if matches:
+        return matches[0]
+    # 回退：取该股票最新的一张图
+    pattern2 = os.path.join(img_base, "**", f"{symbol}*.png")
+    all_imgs = glob.glob(pattern2, recursive=True)
+    if not all_imgs:
+        return None
+    # 尝试按日期排序
+    def _extract_date(p):
+        base = os.path.basename(p).replace(".png", "")
+        parts = base.split("_")
+        if len(parts) >= 2:
+            return parts[1]
+        return "00000000"
+    all_imgs.sort(key=_extract_date, reverse=True)
+    return all_imgs[0]
 
 st.set_page_config(page_title="VisionQuant Pro", layout="wide", page_icon="🦄")
 st.markdown("""
@@ -391,12 +406,16 @@ if mode == "🔍 单只股票分析":
                         sim_score = m.get("score", 0)
                 corr_norm = None if corr is None else (float(corr) + 1.0) / 2.0
                 pix_sim = m.get("pixel_sim")
+                edge_sim = m.get("edge_sim")
+                ret_corr = m.get("ret_corr")
                 rows.append({
                     "股票": f"{m.get('symbol')}",
                     "日期": f"{m.get('date')}",
                     "相似度": round(float(sim_score), 4),
                     "像素相似": "N/A" if pix_sim is None else round(float(pix_sim), 4),
+                    "边缘相似": "N/A" if edge_sim is None else round(float(edge_sim), 4),
                     "相关性": "N/A" if corr_norm is None else round(float(corr_norm), 4),
+                    "回报相关": "N/A" if ret_corr is None else round(float((ret_corr+1)/2), 4),
                     "最终分": round(float(m.get("score", 0)), 4)
                 })
             with st.expander("🔍 相似度分解（可解释）", expanded=False):

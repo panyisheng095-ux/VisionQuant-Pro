@@ -36,41 +36,16 @@ from src.models.attention_cae import AttentionCAE
 class VisionEngine:
     def __init__(self):
         self.device = torch.device("cpu")
-        
+        self.model = None
+        self.pool = None
+        self.model_mode = None  # "attention" | "cae"
+
         # 1. 优先加载 AttentionCAE，如果不存在则回退到 QuantCAE
-        use_attention = os.path.exists(ATTENTION_MODEL_PATH)
-        
-        if use_attention:
-            print(f"👁️ [VisionEngine] 启动中... 加载模型: AttentionCAE")
-            self.model = AttentionCAE(latent_dim=1024, num_attention_heads=8).to(self.device)
-            try:
-                state_dict = torch.load(ATTENTION_MODEL_PATH, map_location=self.device)
-                self.model.load_state_dict(state_dict)
-                self.model.eval()
-                print(f"✅ AttentionCAE 加载成功")
-            except Exception as e:
-                print(f"❌ AttentionCAE 权重加载失败: {e}，回退到 QuantCAE")
-                use_attention = False
-        
-        if not use_attention:
-            print(f"👁️ [VisionEngine] 启动中... 加载模型: QuantCAE (回退模式)")
-            from src.models.autoencoder import QuantCAE
-            self.model = QuantCAE().to(self.device)
-            if os.path.exists(CAE_MODEL_PATH):
-                try:
-                    state_dict = torch.load(CAE_MODEL_PATH, map_location=self.device)
-                    self.model.load_state_dict(state_dict)
-                    self.model.eval()
-                    print(f"✅ QuantCAE 加载成功")
-                except Exception as e:
-                    print(f"❌ QuantCAE 权重加载失败: {e}")
-        
-        # QuantCAE 需要 pool 降维，AttentionCAE 已经输出 1024 维
-        self.use_attention = use_attention
-        if not use_attention:
-            self.pool = nn.AdaptiveAvgPool1d(1024)
+        if os.path.exists(ATTENTION_MODEL_PATH):
+            if not self._load_attention_model():
+                self._load_cae_model()
         else:
-            self.pool = None  # AttentionCAE 不需要 pool
+            self._load_cae_model()
 
         self.preprocess = transforms.Compose([
             transforms.Resize((224, 224)),
@@ -80,6 +55,42 @@ class VisionEngine:
         self.index = None
         self.meta_data = []
         self._pixel_cache = {}
+        self._edge_cache = {}
+        self._data_loader = None
+
+    def _load_attention_model(self):
+        try:
+            print(f"👁️ [VisionEngine] 启动中... 加载模型: AttentionCAE")
+            self.model = AttentionCAE(latent_dim=1024, num_attention_heads=8).to(self.device)
+            state_dict = torch.load(ATTENTION_MODEL_PATH, map_location=self.device)
+            self.model.load_state_dict(state_dict)
+            self.model.eval()
+            self.use_attention = True
+            self.pool = None
+            self.model_mode = "attention"
+            print(f"✅ AttentionCAE 加载成功")
+            return True
+        except Exception as e:
+            print(f"❌ AttentionCAE 权重加载失败: {e}")
+            return False
+
+    def _load_cae_model(self):
+        try:
+            print(f"👁️ [VisionEngine] 启动中... 加载模型: QuantCAE (回退模式)")
+            from src.models.autoencoder import QuantCAE
+            self.model = QuantCAE().to(self.device)
+            if os.path.exists(CAE_MODEL_PATH):
+                state_dict = torch.load(CAE_MODEL_PATH, map_location=self.device)
+                self.model.load_state_dict(state_dict)
+                self.model.eval()
+                print(f"✅ QuantCAE 加载成功")
+            self.use_attention = False
+            self.pool = nn.AdaptiveAvgPool1d(1024)
+            self.model_mode = "cae"
+            return True
+        except Exception as e:
+            print(f"❌ QuantCAE 权重加载失败: {e}")
+            return False
 
     def reload_index(self):
         # 优先加载 AttentionCAE 索引
@@ -89,6 +100,14 @@ class VisionEngine:
         if not os.path.exists(index_file):
             print(f"❌ 索引文件不存在: {index_file}")
             return False
+
+        # 索引与模型对齐
+        index_mode = "attention" if index_file == ATTENTION_INDEX_FILE else "cae"
+        if self.model_mode != index_mode:
+            if index_mode == "attention":
+                self._load_attention_model()
+            else:
+                self._load_cae_model()
 
         print(f"📥 [VisionEngine] 加载索引: {os.path.basename(index_file)}")
         try:
@@ -180,6 +199,37 @@ class VisionEngine:
         denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-8
         return float(np.dot(a, b) / denom)
 
+    def _pearson_corr(self, a, b):
+        if a is None or b is None:
+            return None
+        if len(a) != len(b):
+            return None
+        try:
+            return float(np.corrcoef(a, b)[0, 1])
+        except Exception:
+            return None
+
+    def _load_edge_vector(self, img_path, size=(64, 64)):
+        """简单边缘特征（像素差分）"""
+        if not img_path:
+            return None
+        if img_path in self._edge_cache:
+            return self._edge_cache[img_path]
+        try:
+            img = Image.open(img_path).convert("L").resize(size)
+            arr = np.asarray(img, dtype=np.float32)
+            gx = np.diff(arr, axis=1, prepend=arr[:, :1])
+            gy = np.diff(arr, axis=0, prepend=arr[:1, :])
+            edge = np.sqrt(gx ** 2 + gy ** 2)
+            edge = (edge - edge.mean()) / (edge.std() + 1e-6)
+            vec = edge.flatten()
+            self._edge_cache[img_path] = vec
+            if len(self._edge_cache) > 500:
+                self._edge_cache.pop(next(iter(self._edge_cache)))
+            return vec
+        except Exception:
+            return None
+
     def search_similar_patterns(self, target_img_path, top_k=10, query_prices=None,
                                 rerank_with_pixels=True, rerank_top_k=80):
         """
@@ -200,7 +250,7 @@ class VisionEngine:
         faiss.normalize_L2(vec)
 
         # === 优化1: 扩大搜索范围，获取更多候选 ===
-        search_k = max(top_k * 10, 200)  # 从200个候选中筛选
+        search_k = max(top_k * 20, 400)  # 从更大候选中筛选
         D, I = self.index.search(vec, search_k)
 
         candidates = []
@@ -215,8 +265,10 @@ class VisionEngine:
         price_df_cache = {}
         if query_prices is not None and len(query_prices) == 20:
             try:
-                from src.data.data_loader import DataLoader
-                loader = DataLoader()
+                if self._data_loader is None:
+                    from src.data.data_loader import DataLoader
+                    self._data_loader = DataLoader()
+                loader = self._data_loader
             except Exception:
                 loader = None
 
@@ -247,6 +299,7 @@ class VisionEngine:
 
             # === 优化3: 计算价格序列相关性（可选）===
             correlation = None
+            ret_corr = None
             if loader is not None:
                 try:
                     if sym not in price_df_cache:
@@ -268,6 +321,14 @@ class VisionEngine:
                             corr = np.corrcoef(query_norm, match_norm)[0, 1]
                             if not np.isnan(corr):
                                 correlation = float(corr)
+                            # 形态回报相关（差分）
+                            q_ret = np.diff(query_prices) / (query_prices[:-1] + 1e-8)
+                            m_ret = np.diff(match_prices) / (match_prices[:-1] + 1e-8)
+                            q_ret = (q_ret - q_ret.mean()) / (q_ret.std() + 1e-8)
+                            m_ret = (m_ret - m_ret.mean()) / (m_ret.std() + 1e-8)
+                            corr2 = np.corrcoef(q_ret, m_ret)[0, 1]
+                            if not np.isnan(corr2):
+                                ret_corr = float(corr2)
                 except Exception:
                     correlation = None
 
@@ -281,6 +342,10 @@ class VisionEngine:
                 # 相关性归一化到 0~1
                 corr_norm = (float(correlation) + 1.0) / 2.0
                 corr_norm = min(max(corr_norm, 0.0), 1.0)
+                # 叠加回报相关
+                if ret_corr is not None:
+                    ret_norm = (float(ret_corr) + 1.0) / 2.0
+                    corr_norm = 0.6 * corr_norm + 0.4 * ret_norm
                 final_score = 0.7 * sim_score + 0.3 * corr_norm
 
             candidates.append({
@@ -289,6 +354,7 @@ class VisionEngine:
                 "score": float(final_score),
                 "vector_score": float(vector_score),
                 "correlation": (None if correlation is None else float(correlation)),
+                "ret_corr": (None if ret_corr is None else float(ret_corr)),
                 "sim_score": float(sim_score),
                 "corr_norm": (None if corr_norm is None else float(corr_norm)),
                 "path": info.get("path")
@@ -300,16 +366,26 @@ class VisionEngine:
         if rerank_with_pixels and candidates:
             q_vec = self._load_pixel_vector(target_img_path)
             if q_vec is not None:
+                q_edge = self._load_edge_vector(target_img_path)
                 for c in candidates[:min(len(candidates), rerank_top_k)]:
                     img_path = self._resolve_image_path(c.get("path"), c["symbol"], c["date"])
                     v = self._load_pixel_vector(img_path)
-                    pix = self._cosine_sim(q_vec, v)
-                    if pix is not None:
-                        pix_norm = (pix + 1.0) / 2.0
-                        corr = c.get("corr_norm")
-                        corr_score = 0.5 if corr is None else corr
-                        c["pixel_sim"] = pix_norm
-                        c["score"] = 0.6 * c.get("sim_score", 0) + 0.3 * pix_norm + 0.1 * corr_score
+                    e = self._load_edge_vector(img_path)
+                    pix_cos = self._cosine_sim(q_vec, v)
+                    pix_corr = self._pearson_corr(q_vec, v)
+                    edge_cos = self._cosine_sim(q_edge, e) if q_edge is not None else None
+                    pix_cos = 0.0 if pix_cos is None else pix_cos
+                    pix_corr = 0.0 if pix_corr is None else pix_corr
+                    edge_cos = 0.0 if edge_cos is None else edge_cos
+                    pix_norm = (pix_cos + 1.0) / 2.0
+                    pix_corr_norm = (pix_corr + 1.0) / 2.0
+                    edge_norm = (edge_cos + 1.0) / 2.0
+                    visual_sim = 0.5 * pix_norm + 0.3 * pix_corr_norm + 0.2 * edge_norm
+                    corr = c.get("corr_norm")
+                    corr_score = 0.5 if corr is None else corr
+                    c["pixel_sim"] = visual_sim
+                    c["edge_sim"] = edge_norm
+                    c["score"] = 0.45 * c.get("sim_score", 0) + 0.35 * visual_sim + 0.20 * corr_score
 
         # === 优化6: 排序并返回（保证Top-K） ===
         candidates.sort(key=lambda x: x['score'], reverse=True)
@@ -379,14 +455,24 @@ class VisionEngine:
         if rerank_with_pixels and candidates and img_paths.get("daily"):
             q_vec = self._load_pixel_vector(img_paths.get("daily"))
             if q_vec is not None:
+                q_edge = self._load_edge_vector(img_paths.get("daily"))
                 for c in candidates[:min(len(candidates), rerank_top_k)]:
                     img_path = self._resolve_image_path(None, c["symbol"], c["date"])
                     v = self._load_pixel_vector(img_path)
-                    pix = self._cosine_sim(q_vec, v)
-                    if pix is not None:
-                        pix_norm = (pix + 1.0) / 2.0
-                        c["pixel_sim"] = pix_norm
-                        c["score"] = 0.7 * c["score"] + 0.3 * pix_norm
+                    e = self._load_edge_vector(img_path)
+                    pix_cos = self._cosine_sim(q_vec, v)
+                    pix_corr = self._pearson_corr(q_vec, v)
+                    edge_cos = self._cosine_sim(q_edge, e) if q_edge is not None else None
+                    pix_cos = 0.0 if pix_cos is None else pix_cos
+                    pix_corr = 0.0 if pix_corr is None else pix_corr
+                    edge_cos = 0.0 if edge_cos is None else edge_cos
+                    pix_norm = (pix_cos + 1.0) / 2.0
+                    pix_corr_norm = (pix_corr + 1.0) / 2.0
+                    edge_norm = (edge_cos + 1.0) / 2.0
+                    visual_sim = 0.5 * pix_norm + 0.3 * pix_corr_norm + 0.2 * edge_norm
+                    c["pixel_sim"] = visual_sim
+                    c["edge_sim"] = edge_norm
+                    c["score"] = 0.7 * c["score"] + 0.3 * visual_sim
         candidates.sort(key=lambda x: x["score"], reverse=True)
         return candidates[:top_k]
 

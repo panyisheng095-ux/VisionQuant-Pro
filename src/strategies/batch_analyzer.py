@@ -235,7 +235,21 @@ class BatchAnalyzer:
                 return p
         pattern = os.path.join(img_base, "**", f"*{symbol}*{date_n}*.png")
         matches = glob.glob(pattern, recursive=True)
-        return matches[0] if matches else None
+        if matches:
+            return matches[0]
+        # 回退：取该股票最新的一张图
+        pattern2 = os.path.join(img_base, "**", f"{symbol}*.png")
+        all_imgs = glob.glob(pattern2, recursive=True)
+        if not all_imgs:
+            return None
+        def _extract_date(p):
+            base = os.path.basename(p).replace(".png", "")
+            parts = base.split("_")
+            if len(parts) >= 2:
+                return parts[1]
+            return "00000000"
+        all_imgs.sort(key=_extract_date, reverse=True)
+        return all_imgs[0]
 
     def _estimate_return(self, win_rate, factor_row):
         """估算预期收益"""
