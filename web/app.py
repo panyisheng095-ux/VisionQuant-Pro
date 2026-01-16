@@ -205,6 +205,25 @@ from streamlit_mic_recorder import mic_recorder
 with st.sidebar:
     st.title("🦄 VisionQuant Pro")
     st.caption("AI 全栈量化投研系统 v8.8")
+    
+    # === 数据源选择 ===
+    with st.expander("⚙️ 数据源设置", expanded=False):
+        ds_map = {"AkShare (免费)": "akshare", "JQData (聚宽)": "jqdata", "RQData (米筐)": "rqdata"}
+        ds_label = st.selectbox("选择数据源", list(ds_map.keys()), index=0)
+        curr_ds = ds_map[ds_label]
+        
+        # 如果选了付费源，检查/提示输入账号
+        if curr_ds in ["jqdata", "rqdata"]:
+            st.caption(f"需提供 {curr_ds} 账号 (或设置环境变量)")
+            ds_user = st.text_input("用户名", key=f"{curr_ds}_user")
+            ds_pass = st.text_input("密码", type="password", key=f"{curr_ds}_pass")
+            if st.button("切换/认证"):
+                eng["loader"].switch_data_source(curr_ds, username=ds_user, password=ds_pass)
+                st.success(f"已尝试切换至 {curr_ds}")
+        else:
+            if eng["loader"].get_current_data_source() != "akshare":
+                eng["loader"].switch_data_source("akshare")
+
     st.divider()
     symbol_input = st.text_input("请输入 A 股代码", value="601899", help="输入6位代码", key="symbol_input")
     symbol = symbol_input.strip().zfill(6)
