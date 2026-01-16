@@ -714,24 +714,6 @@ if mode == "🔍 单只股票分析":
 
         with tab_fa:
             st.subheader("📈 因子有效性分析")
-            with st.expander("ℹ️ 因子分析说明", expanded=False):
-                st.markdown("""
-                **因子有效性分析内容**:
-                - **因子定义**: K线学习因子 = 相似度加权的混合胜率（作为期望收益代理）
-                - **IC分析**: 因子值与未来收益率的相关系数（Information Coefficient）
-                - **Rolling IC**: 滚动窗口IC统计，观察因子稳定性
-                - **Regime分析**: 不同市场状态（牛市/熊市/震荡）下的因子表现
-                - **因子衰减**: 因子有效性随时间的变化趋势
-                - **因子失效检测**: 多维度检测因子是否失效（IC衰减、拥挤度等）
-                """)
-            with st.expander("📌 指标怎么解读（简版）", expanded=False):
-                st.markdown(r"""
-                - **平均IC**：越大越好；\(|IC|<0.02\) 通常很弱，\(|IC|>0.05\) 才有研究价值  
-                - **ICIR**：\(\text{IC均值}/\text{IC标准差}\)，衡量稳定性；>1 较强  
-                - **正IC比例**：Rolling IC > 0 的占比，越高越好  
-                - **Regime分布**：当前样本处于牛/熊/震荡/未知的比例（样本不足会出现 unknown）  
-                - **衰减**：近期IC相对早期IC变弱则提示“衰减风险”  
-                """)
             render_factor_analysis(symbol, d["df_f"], eng, PROJECT_ROOT)
 
         st.divider()

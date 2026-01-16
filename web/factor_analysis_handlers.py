@@ -204,13 +204,26 @@ def _plot_ic_curve(rolling_ic, ic_result):
     )
     st.plotly_chart(fig, use_container_width=True)
     
-    with st.expander("ℹ️ IC 指标解读 (v3.0)", expanded=False):
-        st.markdown("""
-        - **IC (Information Coefficient)**: 因子值与未来收益率的相关性。
-        - **IC > 0.05**: 显著正向因子（因子分越高，未来涨幅越大）。
-        - **IC < -0.05**: 显著反向因子（因子分越高，未来反而跌，**可作为反向指标使用**）。
-        - **ICIR (IC/Std)**: 因子的稳定性，绝对值 > 1.0 为优秀。
-        - **Half-Life**: 因子预测能力的半衰期（天），越长越适合中长线。
+    with st.expander("ℹ️ 因子分析说明与指标解读", expanded=False):
+        st.markdown(r"""
+        **1. 核心概念**
+        - **因子定义**: K线学习因子 = 相似度加权的混合胜率（作为期望收益代理）
+        - **IC (Information Coefficient)**: 因子值与未来收益率的相关系数。反映因子预测能力。
+        - **Rolling IC**: 滚动窗口下的IC值，用于观察因子随时间的稳定性。
+
+        **2. 指标解读标准**
+        - **平均IC**:
+          - `> 0.05`: 显著正向（因子分越高，未来涨幅越大）
+          - `< -0.05`: 显著反向（可作为反向指标使用）
+          - `abs(IC) < 0.02`: 预测能力微弱
+        - **ICIR (IC/Std)**: 衡量因子稳定性（IC均值/IC标准差）。绝对值 `> 1.0` 为优秀。
+        - **正IC比例**: 滚动IC > 0 的时间占比，越高越好。
+        - **Half-Life (半衰期)**: 因子预测能力衰减一半所需天数。越长越适合中长线。
+
+        **3. 进阶分析**
+        - **Regime分析**: 在不同市场状态（牛/熊/震荡）下的因子表现差异。
+        - **因子衰减**: 观察近期IC是否显著弱于早期IC，提示失效风险。
+        - **失效检测**: 综合IC衰减、拥挤度等维度判断因子是否失效。
         """)
 
 def _plot_sharpe_curve(ic_result):
