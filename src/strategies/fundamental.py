@@ -207,9 +207,28 @@ class FundamentalMiner:
             if code_col:
                 full_market[code_col] = full_market[code_col].astype(str).str.zfill(6)
 
-            if ind_col and industry not in ["未知", "上海主板", "深圳主板", "创业板", "科创板"]:
+            peers_df = pd.DataFrame()
+            
+            # 优先尝试：通过行业名称获取该行业成分股 (修复：紫金矿业匹配银行问题)
+            if industry and industry not in ["未知", "上海主板", "深圳主板", "创业板", "科创板"]:
+                try:
+                    # 获取行业成分股代码列表
+                    cons_df = ak.stock_board_industry_cons_em(symbol=industry)
+                    if cons_df is not None and not cons_df.empty:
+                        cons_code_col = next((c for c in cons_df.columns if '代码' in c), None)
+                        if cons_code_col:
+                            cons_codes = cons_df[cons_code_col].astype(str).str.zfill(6).tolist()
+                            if cons_codes and code_col:
+                                peers_df = full_market[full_market[code_col].isin(cons_codes)].copy()
+                except Exception as e:
+                    print(f"⚠️ 获取行业成分股失败 ({industry}): {e}")
+
+            # 兜底1：如果 spot_df 自带行业列，且上面获取成分股失败
+            if peers_df.empty and ind_col and industry not in ["未知", "上海主板", "深圳主板", "创业板", "科创板"]:
                 peers_df = full_market[full_market[ind_col] == industry].copy()
-            else:
+            
+            # 兜底2：如果还是没找到，才使用板块前缀（这会导致紫金矿业匹配到银行，作为最后防线）
+            if peers_df.empty:
                 # 使用板块前缀兜底
                 peers_df = full_market[full_market[code_col].astype(str).str.startswith(symbol[:2])].copy()
 
