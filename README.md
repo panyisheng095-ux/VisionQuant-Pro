@@ -164,9 +164,7 @@
 
 ## 核心功能
 
-
-Uploading b789c145765227b1fa199e5f2944f722.mp4…
-
+https://github.com/user-attachments/assets/c13a0d82-1063-4dde-9e07-289fb1d64ac0
 
 ### 1. Top10历史形态对比（核心卖点）
 
