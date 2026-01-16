@@ -34,30 +34,44 @@ if PROJECT_ROOT not in sys.path:
 from src.models.attention_cae import AttentionCAE
 
 
-def _dtw_distance(s1, s2):
+def _dtw_distance(s1, s2, window=5):
     """
-    动态时间规整 (DTW) 距离计算
-    用于匹配两个价格序列的形态相似度，允许时间轴上的非线性对齐
+    快速DTW (Dynamic Time Warping) 距离计算
+    使用Sakoe-Chiba带约束加速，复杂度从O(n²)降到O(n*window)
+    
+    Args:
+        s1, s2: 两个价格序列
+        window: 带约束窗口大小（默认5，即允许±5的时间偏移）
     """
     try:
         n, m = len(s1), len(s2)
         if n == 0 or m == 0:
             return float('inf')
-        # 归一化到0-1
+        
+        # 归一化到0-1（保留形态，消除绝对价格差异）
+        s1 = np.array(s1, dtype=float)
+        s2 = np.array(s2, dtype=float)
         s1 = (s1 - np.min(s1)) / (np.max(s1) - np.min(s1) + 1e-8)
         s2 = (s2 - np.min(s2)) / (np.max(s2) - np.min(s2) + 1e-8)
-        # DTW矩阵
+        
+        # Sakoe-Chiba带约束DTW
         dtw_matrix = np.full((n + 1, m + 1), float('inf'))
         dtw_matrix[0, 0] = 0
+        
         for i in range(1, n + 1):
-            for j in range(1, m + 1):
+            # 只计算窗口内的点
+            j_start = max(1, i - window)
+            j_end = min(m + 1, i + window + 1)
+            for j in range(j_start, j_end):
                 cost = abs(s1[i - 1] - s2[j - 1])
                 dtw_matrix[i, j] = cost + min(
                     dtw_matrix[i - 1, j],      # 插入
                     dtw_matrix[i, j - 1],      # 删除
                     dtw_matrix[i - 1, j - 1]   # 匹配
                 )
-        return dtw_matrix[n, m] / max(n, m)  # 归一化
+        
+        # 归一化到0-1范围（距离越小越相似）
+        return dtw_matrix[n, m] / max(n, m)
     except Exception:
         return float('inf')
 
@@ -321,12 +335,17 @@ class VisionEngine:
     def search_similar_patterns(self, target_img_path, top_k=10, query_prices=None,
                                 rerank_with_pixels=True, rerank_top_k=80):
         """
-        混合搜索：视觉特征 + 价格序列相关性
+        【核心改进】DTW主导 + 视觉辅助的混合检索
+        
+        核心思路：
+        1. FAISS只做粗筛（获取2000+候选）
+        2. DTW + 形态特征做精排（真正决定"像不像"）
+        3. 最终按DTW相似度排序
         
         Args:
             target_img_path: 查询K线图路径
             top_k: 返回Top-K结果
-            query_prices: 查询的价格序列（20天收盘价），用于计算相关性
+            query_prices: 查询的价格序列（20天收盘价），用于计算DTW
         """
         if self.index is None:
             if not self.reload_index(): return []
@@ -337,8 +356,9 @@ class VisionEngine:
         vec = vec.astype('float32').reshape(1, -1)
         faiss.normalize_L2(vec)
 
-        # === 优化1: 扩大搜索范围，获取更多候选 ===
-        search_k = max(top_k * 20, 400)  # 从更大候选中筛选
+        # === 关键改进1: 大幅扩大粗筛范围（从400→2000）===
+        # 因为CNN特征不可靠，需要从更大范围中用DTW精选
+        search_k = max(top_k * 200, 2000)
         D, I = self.index.search(vec, search_k)
 
         candidates = []
@@ -442,25 +462,27 @@ class VisionEngine:
                 except Exception:
                     correlation = None
 
-            # === 优化4: 评分策略（视觉 + 相关性 + DTW + 形态特征）===
+            # === 【核心改进】DTW主导的评分策略 ===
             sim_score = self._vector_score_to_similarity(vector_score)
 
+            # 相关性归一化
             corr_norm = None
-            combined_score = sim_score
-            
             if correlation is not None:
-                # 相关性归一化到 0~1
                 corr_norm = (float(correlation) + 1.0) / 2.0
                 corr_norm = min(max(corr_norm, 0.0), 1.0)
-                # 叠加回报相关
                 if ret_corr is not None:
                     ret_norm = (float(ret_corr) + 1.0) / 2.0
                     corr_norm = 0.5 * corr_norm + 0.5 * ret_norm
-                
-                # 综合评分：视觉30% + 相关性30% + DTW20% + 形态特征20%
-                dtw_score = dtw_sim if dtw_sim is not None else sim_score
-                feat_score = feature_sim if feature_sim is not None else sim_score
-                combined_score = 0.30 * sim_score + 0.30 * corr_norm + 0.20 * dtw_score + 0.20 * feat_score
+            
+            # 【关键】DTW主导评分：DTW 50% + 相关性 30% + 形态 15% + 视觉 5%
+            # 如果没有价格数据，则回退到纯视觉
+            if dtw_sim is not None:
+                dtw_score = dtw_sim
+                feat_score = feature_sim if feature_sim is not None else 0.5
+                corr_score = corr_norm if corr_norm is not None else 0.5
+                combined_score = 0.50 * dtw_score + 0.30 * corr_score + 0.15 * feat_score + 0.05 * sim_score
+            else:
+                combined_score = sim_score * 0.3  # 无DTW则大幅降权
 
             candidates.append({
                 "symbol": sym,
@@ -478,79 +500,48 @@ class VisionEngine:
             })
 
             seen_dates.setdefault(sym, []).append(current_dt)
+            
+            # 【性能优化】已收集足够高质量候选时提前终止
+            high_quality = [c for c in candidates if c.get("dtw_sim") is not None and c["dtw_sim"] > 0.8]
+            if len(high_quality) >= top_k * 3:
+                break
 
-        # === 视觉重排：像素级相似度兜底（提升“肉眼相似”效果） ===
-        if rerank_with_pixels and candidates:
-            q_vec = self._load_pixel_vector(target_img_path)
-            if q_vec is not None:
-                q_edge = self._load_edge_vector(target_img_path)
-                for c in candidates[:min(len(candidates), rerank_top_k)]:
-                    img_path = self._resolve_image_path(c.get("path"), c["symbol"], c["date"])
-                    v = self._load_pixel_vector(img_path)
-                    e = self._load_edge_vector(img_path)
-                    pix_cos = self._cosine_sim(q_vec, v)
-                    pix_corr = self._pearson_corr(q_vec, v)
-                    edge_cos = self._cosine_sim(q_edge, e) if q_edge is not None else None
-                    pix_cos = 0.0 if pix_cos is None else pix_cos
-                    pix_corr = 0.0 if pix_corr is None else pix_corr
-                    edge_cos = 0.0 if edge_cos is None else edge_cos
-                    pix_norm = (pix_cos + 1.0) / 2.0
-                    pix_corr_norm = (pix_corr + 1.0) / 2.0
-                    edge_norm = (edge_cos + 1.0) / 2.0
-                    visual_sim = 0.5 * pix_norm + 0.3 * pix_corr_norm + 0.2 * edge_norm
-                    corr = c.get("corr_norm")
-                    corr_score = 0.5 if corr is None else corr
-                    c["pixel_sim"] = visual_sim
-                    c["edge_sim"] = edge_norm
-                    c["score"] = 0.45 * c.get("sim_score", 0) + 0.35 * visual_sim + 0.20 * corr_score
-
-        # === 优化6: 趋势方向硬约束 + 强相关性过滤 + 综合重排序 ===
+        # === 【核心改进】DTW主导的最终排序 ===
         if query_prices is not None and len(query_prices) >= 2:
-            # 1. 趋势方向硬约束：查询图是涨还是跌，结果必须同方向
+            # Step 1: 趋势方向硬约束（必须同涨同跌）
             query_trend = 1 if query_prices[-1] > query_prices[0] else -1
             
+            # 只保留趋势方向一致的候选
             trend_matched = [
                 c for c in candidates 
                 if c.get("match_trend") is None or c.get("match_trend") == query_trend
             ]
             
-            # 2. 强相关性过滤：保留相关性高 OR DTW相似度高的结果
-            strict_candidates = [
-                c for c in trend_matched 
-                if (c.get("correlation") is not None and c["correlation"] > 0.6)
-                or (c.get("dtw_sim") is not None and c["dtw_sim"] > 0.7)
-                or (c.get("feature_sim") is not None and c["feature_sim"] > 0.75)
-            ]
+            # Step 2: 优先选择有DTW分数的候选
+            dtw_candidates = [c for c in trend_matched if c.get("dtw_sim") is not None]
+            no_dtw_candidates = [c for c in trend_matched if c.get("dtw_sim") is None]
             
-            # 如果过滤后结果不足，逐步放宽标准
-            if len(strict_candidates) < top_k:
-                medium_candidates = [
-                    c for c in trend_matched 
-                    if (c.get("correlation") is not None and c["correlation"] > 0.4)
-                    or (c.get("dtw_sim") is not None and c["dtw_sim"] > 0.5)
-                ]
-                if len(medium_candidates) >= top_k:
-                    strict_candidates = medium_candidates
-                elif len(trend_matched) >= top_k:
-                    strict_candidates = trend_matched
-                else:
-                    strict_candidates = candidates  # 兜底：放弃过滤
+            # Step 3: DTW候选按DTW相似度排序（这是关键！）
+            dtw_candidates.sort(key=lambda x: x.get("dtw_sim", 0), reverse=True)
             
-            candidates = strict_candidates
+            # Step 4: 无DTW候选按相关性排序
+            no_dtw_candidates.sort(key=lambda x: x.get("correlation", 0) or 0, reverse=True)
             
-            # 3. 综合重排序：DTW + 相关性 + 形态特征为主，视觉为辅
+            # Step 5: 合并（DTW优先）
+            candidates = dtw_candidates + no_dtw_candidates
+            
+            # Step 6: 最终评分（用于显示，但排序已经按DTW完成）
             for c in candidates:
-                s = c.get("sim_score", 0.5)
-                corr = c.get("corr_norm", 0.5)
-                pix = c.get("pixel_sim", s)
-                dtw = c.get("dtw_sim", s)
-                feat = c.get("feature_sim", s)
-                
-                # 新评分公式：强调DTW和形态特征
-                # DTW 25% + 形态特征 25% + 相关性 25% + 视觉 15% + 像素 10%
-                c["score"] = 0.25 * dtw + 0.25 * feat + 0.25 * corr + 0.15 * s + 0.10 * pix
-                
-            candidates.sort(key=lambda x: x['score'], reverse=True)
+                dtw = c.get("dtw_sim", 0)
+                corr = c.get("correlation", 0) or 0
+                corr_norm = (corr + 1.0) / 2.0
+                feat = c.get("feature_sim", 0.5)
+                # 最终分数（仅供显示）
+                c["score"] = 0.60 * dtw + 0.25 * corr_norm + 0.15 * feat if dtw > 0 else corr_norm * 0.5
+        
+        else:
+            # 无价格序列时，回退到纯视觉排序
+            candidates.sort(key=lambda x: x.get("sim_score", 0), reverse=True)
 
         # 返回Top-K
         return candidates[:top_k]
