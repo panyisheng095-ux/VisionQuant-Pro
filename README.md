@@ -1,4 +1,4 @@
-<img width="270" height="214" alt="image" src="https://github.com/user-attachments/assets/874c837a-b0b7-43b0-9c6a-9a6afb952176" /># VisionQuant-Pro: K线视觉学习因子智能投研系统
+VisionQuant-Pro: K线视觉学习因子智能投研系统
 
 <div align="center">
 
