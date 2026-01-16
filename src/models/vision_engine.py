@@ -10,6 +10,7 @@ import glob
 import pandas as pd
 import numpy as np
 from datetime import datetime
+from scipy.spatial.distance import cdist
 
 # === 1. 基础配置 ===
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
@@ -31,6 +32,84 @@ META_PKL = os.path.join(PROJECT_ROOT, "data", "indices", "meta.pkl")
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 from src.models.attention_cae import AttentionCAE
+
+
+def _dtw_distance(s1, s2):
+    """
+    动态时间规整 (DTW) 距离计算
+    用于匹配两个价格序列的形态相似度，允许时间轴上的非线性对齐
+    """
+    try:
+        n, m = len(s1), len(s2)
+        if n == 0 or m == 0:
+            return float('inf')
+        # 归一化到0-1
+        s1 = (s1 - np.min(s1)) / (np.max(s1) - np.min(s1) + 1e-8)
+        s2 = (s2 - np.min(s2)) / (np.max(s2) - np.min(s2) + 1e-8)
+        # DTW矩阵
+        dtw_matrix = np.full((n + 1, m + 1), float('inf'))
+        dtw_matrix[0, 0] = 0
+        for i in range(1, n + 1):
+            for j in range(1, m + 1):
+                cost = abs(s1[i - 1] - s2[j - 1])
+                dtw_matrix[i, j] = cost + min(
+                    dtw_matrix[i - 1, j],      # 插入
+                    dtw_matrix[i, j - 1],      # 删除
+                    dtw_matrix[i - 1, j - 1]   # 匹配
+                )
+        return dtw_matrix[n, m] / max(n, m)  # 归一化
+    except Exception:
+        return float('inf')
+
+
+def _extract_kline_features(prices):
+    """
+    提取K线形态的关键特征向量（用于形态匹配）
+    返回8维特征：
+    1. 整体趋势方向 (涨/跌)
+    2. 涨跌幅
+    3. 波动率
+    4. 最高点位置（相对）
+    5. 最低点位置（相对）
+    6. 头部形态（前1/3涨跌）
+    7. 中部形态（中1/3涨跌）
+    8. 尾部形态（后1/3涨跌）
+    """
+    try:
+        if len(prices) < 6:
+            return None
+        prices = np.array(prices, dtype=float)
+        n = len(prices)
+        
+        # 1. 整体趋势方向 (1=涨, -1=跌)
+        trend = 1 if prices[-1] > prices[0] else -1
+        
+        # 2. 涨跌幅 (归一化)
+        change = (prices[-1] - prices[0]) / (prices[0] + 1e-8)
+        change_norm = np.tanh(change * 10)  # 映射到-1~1
+        
+        # 3. 波动率
+        returns = np.diff(prices) / (prices[:-1] + 1e-8)
+        volatility = np.std(returns) * np.sqrt(252)
+        vol_norm = min(volatility / 0.5, 1.0)  # 归一化到0~1
+        
+        # 4-5. 最高/最低点位置 (相对位置)
+        high_pos = np.argmax(prices) / (n - 1)
+        low_pos = np.argmin(prices) / (n - 1)
+        
+        # 6-8. 分段趋势
+        seg_len = n // 3
+        head = (prices[seg_len] - prices[0]) / (prices[0] + 1e-8)
+        mid = (prices[2 * seg_len] - prices[seg_len]) / (prices[seg_len] + 1e-8)
+        tail = (prices[-1] - prices[2 * seg_len]) / (prices[2 * seg_len] + 1e-8)
+        
+        return np.array([
+            float(trend), change_norm, vol_norm,
+            high_pos, low_pos,
+            np.tanh(head * 10), np.tanh(mid * 10), np.tanh(tail * 10)
+        ])
+    except Exception:
+        return None
 
 
 class VisionEngine:
@@ -140,9 +219,9 @@ class VisionEngine:
                     return feature.cpu().numpy().flatten()
                 else:
                     # QuantCAE.encode() 返回 50176 维，需要 pool 降维
-                full_feature = self.model.encode(input_tensor)
-                reduced_feature = self.pool(full_feature.unsqueeze(1)).squeeze(1)
-                return reduced_feature.cpu().numpy().flatten()
+                    full_feature = self.model.encode(input_tensor)
+                    reduced_feature = self.pool(full_feature.unsqueeze(1)).squeeze(1)
+                    return reduced_feature.cpu().numpy().flatten()
         except:
             return None
 
@@ -306,9 +385,13 @@ class VisionEngine:
             if is_conflict:
                 continue
 
-            # === 优化3: 计算价格序列相关性（可选）===
+            # === 优化3: 计算价格序列相关性 + DTW + 形态特征（可选）===
             correlation = None
             ret_corr = None
+            dtw_sim = None
+            feature_sim = None
+            match_trend = None
+            
             if loader is not None:
                 try:
                     if sym not in price_df_cache:
@@ -325,45 +408,70 @@ class VisionEngine:
                         loc = dfp.index.get_loc(current_dt)
                         if loc >= 19:
                             match_prices = dfp.iloc[loc - 19: loc + 1]['Close'].values
+                            
+                            # A. 价格相关性
                             query_norm = (query_prices - query_prices.mean()) / (query_prices.std() + 1e-8)
                             match_norm = (match_prices - match_prices.mean()) / (match_prices.std() + 1e-8)
                             corr = np.corrcoef(query_norm, match_norm)[0, 1]
                             if not np.isnan(corr):
                                 correlation = float(corr)
-                            # 形态回报相关（差分）
+                            
+                            # B. 回报序列相关
                             q_ret = np.diff(query_prices) / (query_prices[:-1] + 1e-8)
                             m_ret = np.diff(match_prices) / (match_prices[:-1] + 1e-8)
-                            q_ret = (q_ret - q_ret.mean()) / (q_ret.std() + 1e-8)
-                            m_ret = (m_ret - m_ret.mean()) / (m_ret.std() + 1e-8)
-                            corr2 = np.corrcoef(q_ret, m_ret)[0, 1]
+                            q_ret_norm = (q_ret - q_ret.mean()) / (q_ret.std() + 1e-8)
+                            m_ret_norm = (m_ret - m_ret.mean()) / (m_ret.std() + 1e-8)
+                            corr2 = np.corrcoef(q_ret_norm, m_ret_norm)[0, 1]
                             if not np.isnan(corr2):
                                 ret_corr = float(corr2)
+                            
+                            # C. DTW形态相似度 (距离越小越相似)
+                            dtw_dist = _dtw_distance(query_prices, match_prices)
+                            dtw_sim = max(0, 1.0 - dtw_dist)  # 转换为相似度
+                            
+                            # D. 形态特征相似度
+                            q_feat = _extract_kline_features(query_prices)
+                            m_feat = _extract_kline_features(match_prices)
+                            if q_feat is not None and m_feat is not None:
+                                # 趋势方向
+                                match_trend = m_feat[0]
+                                # 特征向量余弦相似度
+                                feat_cos = np.dot(q_feat, m_feat) / (np.linalg.norm(q_feat) * np.linalg.norm(m_feat) + 1e-8)
+                                feature_sim = (feat_cos + 1.0) / 2.0
+                                
                 except Exception:
                     correlation = None
 
-            # === 优化4: 评分策略（相似度校准 + 相关性增强）===
+            # === 优化4: 评分策略（视觉 + 相关性 + DTW + 形态特征）===
             sim_score = self._vector_score_to_similarity(vector_score)
 
             corr_norm = None
-            if correlation is None:
-                final_score = sim_score
-            else:
+            combined_score = sim_score
+            
+            if correlation is not None:
                 # 相关性归一化到 0~1
                 corr_norm = (float(correlation) + 1.0) / 2.0
                 corr_norm = min(max(corr_norm, 0.0), 1.0)
                 # 叠加回报相关
                 if ret_corr is not None:
                     ret_norm = (float(ret_corr) + 1.0) / 2.0
-                    corr_norm = 0.6 * corr_norm + 0.4 * ret_norm
-                final_score = 0.7 * sim_score + 0.3 * corr_norm
+                    corr_norm = 0.5 * corr_norm + 0.5 * ret_norm
+                
+                # 综合评分：视觉30% + 相关性30% + DTW20% + 形态特征20%
+                dtw_score = dtw_sim if dtw_sim is not None else sim_score
+                feat_score = feature_sim if feature_sim is not None else sim_score
+                combined_score = 0.30 * sim_score + 0.30 * corr_norm + 0.20 * dtw_score + 0.20 * feat_score
 
             candidates.append({
                 "symbol": sym,
                 "date": date_str,
-                "score": float(final_score),
+                "score": float(combined_score),
                 "vector_score": float(vector_score),
                 "correlation": (None if correlation is None else float(correlation)),
                 "ret_corr": (None if ret_corr is None else float(ret_corr)),
+                "dtw_sim": (None if dtw_sim is None else float(dtw_sim)),
+                "feature_sim": (None if feature_sim is None else float(feature_sim)),
+                "match_trend": match_trend,
                 "sim_score": float(sim_score),
                 "corr_norm": (None if corr_norm is None else float(corr_norm)),
                 "path": info.get("path")
@@ -396,28 +504,51 @@ class VisionEngine:
                     c["edge_sim"] = edge_norm
                     c["score"] = 0.45 * c.get("sim_score", 0) + 0.35 * visual_sim + 0.20 * corr_score
 
-        # === 优化6: 强相关性过滤 (Strict Filter) & 重排序 ===
-        # 只有当原始相关性较高时，才认为视觉“像”（趋势一致）。
-        # 如果 embedding 相似但相关性很低，说明只是震荡幅度像但走势相反，用户会觉得“不像”。
-        if query_prices is not None:
-            # 1. 过滤：保留相关性 > 0.5 或 回报相关 > 0.4 的结果
-            #    (如果过滤后太少，则放宽标准)
-            strict_candidates = [
+        # === 优化6: 趋势方向硬约束 + 强相关性过滤 + 综合重排序 ===
+        if query_prices is not None and len(query_prices) >= 2:
+            # 1. 趋势方向硬约束：查询图是涨还是跌，结果必须同方向
+            query_trend = 1 if query_prices[-1] > query_prices[0] else -1
+            
+            trend_matched = [
                 c for c in candidates 
-                if (c.get("correlation") is not None and c["correlation"] > 0.5) 
-                or (c.get("ret_corr") is not None and c["ret_corr"] > 0.4)
+                if c.get("match_trend") is None or c.get("match_trend") == query_trend
             ]
             
-            if len(strict_candidates) >= top_k:
-                candidates = strict_candidates
+            # 2. 强相关性过滤：保留相关性高 OR DTW相似度高的结果
+            strict_candidates = [
+                c for c in trend_matched 
+                if (c.get("correlation") is not None and c["correlation"] > 0.6)
+                or (c.get("dtw_sim") is not None and c["dtw_sim"] > 0.7)
+                or (c.get("feature_sim") is not None and c["feature_sim"] > 0.75)
+            ]
             
-            # 2. 重排序：显著提升相关性权重，让走势更一致的排前面
-            #    New Score = 0.4 * Sim + 0.4 * Corr + 0.2 * Pixel
+            # 如果过滤后结果不足，逐步放宽标准
+            if len(strict_candidates) < top_k:
+                medium_candidates = [
+                    c for c in trend_matched 
+                    if (c.get("correlation") is not None and c["correlation"] > 0.4)
+                    or (c.get("dtw_sim") is not None and c["dtw_sim"] > 0.5)
+                ]
+                if len(medium_candidates) >= top_k:
+                    strict_candidates = medium_candidates
+                elif len(trend_matched) >= top_k:
+                    strict_candidates = trend_matched
+                else:
+                    strict_candidates = candidates  # 兜底：放弃过滤
+            
+            candidates = strict_candidates
+            
+            # 3. 综合重排序：DTW + 相关性 + 形态特征为主，视觉为辅
             for c in candidates:
-                s = c.get("sim_score", 0)
+                s = c.get("sim_score", 0.5)
                 corr = c.get("corr_norm", 0.5)
-                pix = c.get("pixel_sim", s) # fallback to sim if pixel not calc
-                c["score"] = 0.4 * s + 0.4 * corr + 0.2 * pix
+                pix = c.get("pixel_sim", s)
+                dtw = c.get("dtw_sim", s)
+                feat = c.get("feature_sim", s)
+                
+                # 新评分公式：强调DTW和形态特征
+                # DTW 25% + 形态特征 25% + 相关性 25% + 视觉 15% + 像素 10%
+                c["score"] = 0.25 * dtw + 0.25 * feat + 0.25 * corr + 0.15 * s + 0.10 * pix
                 
             candidates.sort(key=lambda x: x['score'], reverse=True)
 
