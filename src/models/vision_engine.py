@@ -224,8 +224,9 @@ class VisionEngine:
 
     def _image_to_vector(self, img_path):
         try:
-            img = Image.open(img_path).convert('RGB')
-            input_tensor = self.preprocess(img).unsqueeze(0).to(self.device)
+            with Image.open(img_path) as img:
+                img = img.convert('RGB')
+                input_tensor = self.preprocess(img).unsqueeze(0).to(self.device)
             with torch.no_grad():
                 if self.use_attention:
                     # AttentionCAE.encode() 已经返回 1024 维的 L2 归一化向量
@@ -254,19 +255,25 @@ class VisionEngine:
         """从元数据或目录中定位历史K线图片"""
         if info_path and os.path.exists(info_path):
             return info_path
-        img_base = os.path.join(PROJECT_ROOT, "data", "images")
         date_n = str(date_str).replace("-", "")
-        candidates = [
-            os.path.join(img_base, f"{symbol}_{date_n}.png"),
-            os.path.join(img_base, symbol, f"{symbol}_{date_n}.png"),
-            os.path.join(img_base, symbol, f"{date_n}.png"),
+        img_bases = [
+            os.path.join(PROJECT_ROOT, "data", "images"),
+            os.path.join(PROJECT_ROOT, "data", "images_v2"),
         ]
-        for p in candidates:
-            if os.path.exists(p):
-                return p
-        pattern = os.path.join(img_base, "**", f"*{symbol}*{date_n}*.png")
-        matches = glob.glob(pattern, recursive=True)
-        return matches[0] if matches else None
+        for img_base in img_bases:
+            candidates = [
+                os.path.join(img_base, f"{symbol}_{date_n}.png"),
+                os.path.join(img_base, symbol, f"{symbol}_{date_n}.png"),
+                os.path.join(img_base, symbol, f"{date_n}.png"),
+            ]
+            for p in candidates:
+                if os.path.exists(p):
+                    return p
+            pattern = os.path.join(img_base, "**", f"*{symbol}*{date_n}*.png")
+            matches = glob.glob(pattern, recursive=True)
+            if matches:
+                return matches[0]
+        return None
 
     def _load_pixel_vector(self, img_path, size=(64, 64)):
         """轻量像素向量（用于视觉重排）"""
@@ -275,8 +282,9 @@ class VisionEngine:
         if img_path in self._pixel_cache:
             return self._pixel_cache[img_path]
         try:
-            img = Image.open(img_path).convert("L").resize(size)
-            arr = np.asarray(img, dtype=np.float32)
+            with Image.open(img_path) as img:
+                img = img.convert("L").resize(size)
+                arr = np.asarray(img, dtype=np.float32)
             arr = (arr - arr.mean()) / (arr.std() + 1e-6)
             vec = arr.flatten()
             self._pixel_cache[img_path] = vec
@@ -318,8 +326,9 @@ class VisionEngine:
         if img_path in self._edge_cache:
             return self._edge_cache[img_path]
         try:
-            img = Image.open(img_path).convert("L").resize(size)
-            arr = np.asarray(img, dtype=np.float32)
+            with Image.open(img_path) as img:
+                img = img.convert("L").resize(size)
+                arr = np.asarray(img, dtype=np.float32)
             gx = np.diff(arr, axis=1, prepend=arr[:, :1])
             gy = np.diff(arr, axis=0, prepend=arr[:1, :])
             edge = np.sqrt(gx ** 2 + gy ** 2)

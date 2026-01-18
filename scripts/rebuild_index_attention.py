@@ -42,6 +42,7 @@ parser = argparse.ArgumentParser(description="用 AttentionCAE 重建 FAISS 索�
 parser.add_argument("--img-dir", type=str, default=DEFAULT_IMG_BASE_DIR, help="K线图目录（默认 data/images）")
 parser.add_argument("--index-file", type=str, default=DEFAULT_INDEX_FILE, help="输出索引文件路径")
 parser.add_argument("--meta-csv", type=str, default=DEFAULT_META_CSV, help="输出元数据CSV路径")
+parser.add_argument("--batch-size", type=int, default=64, help="编码批大小（建议 32-128）")
 args = parser.parse_args()
 
 IMG_BASE_DIR = args.img_dir
@@ -87,6 +88,7 @@ print("="*60)
 
 # 查找所有 PNG 文件
 all_img_paths = glob.glob(os.path.join(IMG_BASE_DIR, "**", "*.png"), recursive=True)
+all_img_paths.sort()
 print(f"✅ 找到 {len(all_img_paths)} 张图片 (目录: {IMG_BASE_DIR})")
 
 if len(all_img_paths) == 0:
@@ -95,30 +97,28 @@ if len(all_img_paths) == 0:
 
 # === 3. 提取特征向量 ===
 print("\n" + "="*60)
-print("🔍 步骤 3: 用 AttentionCAE 编码所有图片")
+print("🔍 步骤 3: 用 AttentionCAE 编码所有图片并构建索引")
 print("="*60)
 print("⚠️  这可能需要 1-2 小时，请耐心等待...")
 
-features_list = []
 meta_list = []
-batch_size = 32  # 批处理大小
+batch_size = max(1, int(args.batch_size))
+index = None
+dim = None
 
 # 创建输出目录
 os.makedirs(os.path.dirname(INDEX_FILE), exist_ok=True)
 
 with torch.no_grad():
-    for i, img_path in enumerate(tqdm(all_img_paths, desc="编码中")):
+    batch_tensors = []
+    batch_meta = []
+    for img_path in tqdm(all_img_paths, desc="编码中"):
         try:
             # 加载图片
-            img = Image.open(img_path).convert('RGB')
-            input_tensor = preprocess(img).unsqueeze(0).to(device)
-            
-            # 编码（AttentionCAE.encode() 返回 1024 维，已 L2 归一化）
-            feature = model.encode(input_tensor)
-            feature_np = feature.cpu().numpy().flatten().astype('float32')
-            
-            features_list.append(feature_np)
-            
+            with Image.open(img_path) as img:
+                img = img.convert('RGB')
+                input_tensor = preprocess(img)
+
             # 从路径提取股票代码和日期
             # 路径格式: data/images/600519/600519_20230101.png
             filename = os.path.basename(img_path)
@@ -130,38 +130,52 @@ with torch.no_grad():
                 # 备用解析
                 symbol = os.path.basename(os.path.dirname(img_path)).zfill(6)
                 date_str = filename.replace('.png', '')
-            
-            meta_list.append({
+
+            batch_tensors.append(input_tensor)
+            batch_meta.append({
                 'symbol': symbol,
                 'date': date_str,
                 'path': img_path
             })
-            
+
+            if len(batch_tensors) >= batch_size:
+                input_batch = torch.stack(batch_tensors).to(device)
+                features = model.encode(input_batch)
+                features_np = features.cpu().numpy().astype('float32')
+
+                if index is None:
+                    dim = features_np.shape[1]
+                    print(f"特征维度: {dim} (应该是 1024)")
+                    index = faiss.IndexFlatIP(dim)
+
+                faiss.normalize_L2(features_np)
+                index.add(features_np)
+                meta_list.extend(batch_meta)
+                batch_tensors.clear()
+                batch_meta.clear()
         except Exception as e:
             print(f"\n⚠️  跳过损坏图片 {img_path}: {e}")
             continue
 
-print(f"\n✅ 编码完成！共处理 {len(features_list)} 张图片")
+    if batch_tensors:
+        input_batch = torch.stack(batch_tensors).to(device)
+        features = model.encode(input_batch)
+        features_np = features.cpu().numpy().astype('float32')
 
-# === 4. 构建 FAISS 索引 ===
-print("\n" + "="*60)
-print("🔨 步骤 4: 构建 FAISS 索引")
-print("="*60)
+        if index is None:
+            dim = features_np.shape[1]
+            print(f"特征维度: {dim} (应该是 1024)")
+            index = faiss.IndexFlatIP(dim)
 
-features_array = np.array(features_list)
-dim = features_array.shape[1]
-print(f"特征维度: {dim} (应该是 1024)")
+        faiss.normalize_L2(features_np)
+        index.add(features_np)
+        meta_list.extend(batch_meta)
 
-# 创建索引（使用内积，因为特征已 L2 归一化）
-index = faiss.IndexFlatIP(dim)
+if index is None or index.ntotal == 0:
+    print("❌ 没有成功编码任何图片，索引构建失败")
+    sys.exit(1)
 
-# 归一化（确保是单位向量）
-faiss.normalize_L2(features_array)
-
-# 添加向量
-print("正在添加向量到索引...")
-index.add(features_array)
-
+print(f"\n✅ 编码完成！共处理 {index.ntotal} 张图片")
 print(f"✅ 索引构建完成！包含 {index.ntotal} 条记录")
 
 # === 5. 保存索引和元数据 ===
@@ -182,10 +196,8 @@ print(f"✅ 元数据已保存: {META_CSV}")
 print("\n" + "="*60)
 print("📝 步骤 6: 更新配置")
 print("="*60)
-print("⚠️  请手动更新 src/models/vision_engine.py 中的索引路径：")
-print(f"   INDEX_FILE = '{INDEX_FILE}'")
-print(f"   META_CSV = '{META_CSV}'")
-print("\n或者直接替换旧索引文件（备份后）：")
+print("✅ VisionEngine 会优先加载 attention 索引，无需手动改路径")
+print("若需兼容旧代码，可备份后替换默认索引文件：")
 print(f"   mv {INDEX_FILE} {os.path.join(PROJECT_ROOT, 'data', 'indices', 'cae_faiss.bin')}")
 print(f"   mv {META_CSV} {os.path.join(PROJECT_ROOT, 'data', 'indices', 'meta_data.csv')}")
 

@@ -162,6 +162,7 @@ def _generate_images_for_symbol_seq(
     stride: int,
     target_images: int,
     stats: dict,
+    max_images_per_symbol: Optional[int] = None,
 ) -> dict:
     generated = 0
     years = set()
@@ -187,6 +188,8 @@ def _generate_images_for_symbol_seq(
 
     for i in range(window - 1, len(df), stride):
         if stats["count"] >= target_images:
+            break
+        if max_images_per_symbol and generated >= max_images_per_symbol:
             break
         date_dt = df.index[i]
         date_str = date_dt.strftime("%Y%m%d")
@@ -219,7 +222,7 @@ def _generate_images_for_symbol_seq(
 
 def _worker_generate_images(args) -> dict:
     (symbol, data_source, start_date, end_date, adjust, output_dir, window, stride,
-     target_images, jq_user, jq_pass, rq_user, rq_pass, shared_counter, lock) = args
+     target_images, max_images_per_symbol, jq_user, jq_pass, rq_user, rq_pass, shared_counter, lock) = args
 
     loader = DataLoader(
         data_source=data_source,
@@ -255,6 +258,8 @@ def _worker_generate_images(args) -> dict:
     for i in range(window - 1, len(df), stride):
         if shared_counter.value >= target_images:
             break
+        if max_images_per_symbol and generated >= max_images_per_symbol:
+            break
         date_dt = df.index[i]
         date_str = date_dt.strftime("%Y%m%d")
         img_path = os.path.join(symbol_dir, f"{symbol}_{date_str}.png")
@@ -287,12 +292,21 @@ def _worker_generate_images(args) -> dict:
     return {"symbol": symbol, "generated": generated, "years": list(years)}
 
 
+def _write_report(report_file: str, data: dict):
+    if not report_file:
+        return
+    os.makedirs(os.path.dirname(report_file), exist_ok=True)
+    with open(report_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
 def main():
     parser = argparse.ArgumentParser(description="构建/扩充K线图像数据集")
     parser.add_argument("--data-source", type=str, default="akshare", choices=["akshare", "jqdata", "rqdata"])
     parser.add_argument("--start-date", type=str, default="20100101")
     parser.add_argument("--end-date", type=str, default=None)
     parser.add_argument("--stride", type=int, default=8)
+    parser.add_argument("--auto-stride", action="store_true", default=False)
     parser.add_argument("--window", type=int, default=20)
     parser.add_argument("--target-images", type=int, default=1000000)
     parser.add_argument("--max-stocks", type=int, default=None)
@@ -300,7 +314,9 @@ def main():
     parser.add_argument("--sleep", type=float, default=0.02)
     parser.add_argument("--output-dir", type=str, default=os.path.join(PROJECT_ROOT, "data", "images"))
     parser.add_argument("--progress-file", type=str, default=os.path.join(PROJECT_ROOT, "data", "progress", "kline_image_build.json"))
+    parser.add_argument("--report-file", type=str, default=os.path.join(PROJECT_ROOT, "data", "progress", "kline_image_report.json"))
     parser.add_argument("--resume", action="store_true", default=True)
+    parser.add_argument("--no-resume", action="store_true", default=False)
     parser.add_argument("--reset-progress", action="store_true", default=False)
     parser.add_argument("--checkpoint-interval", type=int, default=5)
     parser.add_argument("--num-workers", type=int, default=1)
@@ -310,6 +326,10 @@ def main():
     parser.add_argument("--jq-pass", type=str, default=None)
     parser.add_argument("--rq-user", type=str, default=None)
     parser.add_argument("--rq-pass", type=str, default=None)
+    parser.add_argument("--max-images-per-symbol", type=int, default=None)
+    parser.add_argument("--skip-existing-scan", action="store_true", default=False)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--shard-total", type=int, default=1)
     args = parser.parse_args()
 
     loader = DataLoader(
@@ -323,6 +343,14 @@ def main():
     if not symbols:
         print("❌ 无法获取股票列表，请检查数据源或 symbols-file")
         sys.exit(1)
+
+    # 分片（多机/多进程协作）
+    if args.shard_total and args.shard_total > 1:
+        if args.shard_index < 0 or args.shard_index >= args.shard_total:
+            print("❌ shard-index 必须在 [0, shard-total) 范围内")
+            sys.exit(1)
+        symbols = [s for i, s in enumerate(symbols) if i % args.shard_total == args.shard_index]
+        print(f"🔀 分片模式: shard {args.shard_index}/{args.shard_total} | 当前股票数: {len(symbols)}")
 
     end_date = args.end_date or datetime.now().strftime("%Y%m%d")
 
@@ -338,6 +366,10 @@ def main():
     if estimate["recommended_stocks"]:
         print(f"若固定时间跨度，目标 {args.target_images:,} 需股票数≈{estimate['recommended_stocks']}")
 
+    if args.auto_stride and estimate["recommended_stride"]:
+        args.stride = max(1, estimate["recommended_stride"])
+        print(f"✅ auto-stride 已应用: stride={args.stride}")
+
     # 候选 stride 组合估算
     stride_candidates = [6, 8, 10, 12]
     cand_lines = []
@@ -352,15 +384,25 @@ def main():
 
     # 进度文件处理
     progress = None
+    resume = args.resume and not args.no_resume
     if args.reset_progress:
         progress = None
-    elif args.resume:
+    elif resume:
         progress = _load_progress(args.progress_file)
 
     processed_symbols = set(progress.get("processed_symbols", [])) if progress else set()
 
     # 扫描已有图片（用于断点续跑）
-    existing_count, covered_symbols, year_counts = _scan_existing_images(args.output_dir)
+    if args.skip_existing_scan and progress:
+        existing_count = progress.get("total_count", 0)
+        covered_symbols = set(progress.get("covered_symbols", []))
+        year_counts = progress.get("year_counts", {})
+    else:
+        existing_count, covered_symbols, year_counts = _scan_existing_images(args.output_dir)
+
+    # 断点续跑：已覆盖股票加入 processed
+    if resume:
+        processed_symbols |= covered_symbols
 
     stats = {
         "count": existing_count,
@@ -380,7 +422,7 @@ def main():
     print(f"📅 区间: {args.start_date} ~ {end_date} | stride={args.stride} | window={args.window}")
     print(f"📁 输出目录: {args.output_dir}")
     print(f"🧾 进度文件: {args.progress_file}")
-    print(f"⚡ 多进程: {args.num_workers} (GPU渲染不适用，图像渲染为CPU；索引重建支持GPU)")
+    print(f"⚡ 多进程: {args.num_workers} (K线图渲染为CPU；索引重建支持GPU)")
 
     processed_count = 0
     pbar = tqdm(pending_symbols, desc="生成K线图")
@@ -398,6 +440,7 @@ def main():
                 stride=args.stride,
                 target_images=args.target_images,
                 stats=stats,
+                max_images_per_symbol=args.max_images_per_symbol,
             )
 
             if result.get("generated", 0) > 0:
@@ -425,6 +468,7 @@ def main():
                     "output_dir": args.output_dir,
                     "total_symbols": len(symbols),
                     "processed_symbols": sorted(list(processed_symbols)),
+                    "covered_symbols": sorted(list(covered_symbols)),
                     "existing_count": stats["existing"],
                     "generated_count": stats["generated"],
                     "total_count": stats["count"],
@@ -442,7 +486,7 @@ def main():
         try:
             tasks = [(
                 s, args.data_source, args.start_date, end_date, args.adjust, args.output_dir,
-                args.window, args.stride, args.target_images,
+                args.window, args.stride, args.target_images, args.max_images_per_symbol,
                 args.jq_user, args.jq_pass, args.rq_user, args.rq_pass,
                 shared_counter, lock
             ) for s in pending_symbols]
@@ -476,6 +520,7 @@ def main():
                         "output_dir": args.output_dir,
                         "total_symbols": len(symbols),
                         "processed_symbols": sorted(list(processed_symbols)),
+                        "covered_symbols": sorted(list(covered_symbols)),
                         "existing_count": stats["existing"],
                         "generated_count": stats["generated"],
                         "total_count": stats["count"],
@@ -489,7 +534,7 @@ def main():
             pool.terminate()
             pool.join()
 
-    # 最后保存一次进度
+    # 最后保存一次进度 + 报告
     progress = {
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "start_date": args.start_date,
@@ -500,6 +545,7 @@ def main():
         "output_dir": args.output_dir,
         "total_symbols": len(symbols),
         "processed_symbols": sorted(list(processed_symbols)),
+        "covered_symbols": sorted(list(covered_symbols)),
         "existing_count": stats["existing"],
         "generated_count": stats["generated"],
         "total_count": stats["count"],
@@ -507,8 +553,20 @@ def main():
     }
     _save_progress(args.progress_file, progress)
 
+    report = {
+        "generated": stats["generated"],
+        "total": stats["count"],
+        "covered_symbols": len(covered_symbols),
+        "total_symbols": len(symbols),
+        "year_span": _format_years(year_counts),
+        "year_counts": year_counts,
+        "output_dir": args.output_dir,
+    }
+    _write_report(args.report_file, report)
+
     print(f"\n✅ 已生成图片数: {stats['generated']:,} | 总数: {stats['count']:,}")
     print(f"覆盖股票: {len(covered_symbols)}/{len(symbols)} | 年份覆盖: {_format_years(year_counts)}")
+    print(f"覆盖报告: {args.report_file}")
     print("下一步: 运行 scripts/rebuild_index_attention.py 重建 FAISS 索引")
 
 
