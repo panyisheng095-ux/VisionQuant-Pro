@@ -19,7 +19,7 @@ createApp({
       activeTab: "bt",
 
       icSymbol: "600519",
-      icStart: "20200101",
+      icStart: "20100101",
       icEnd: "",
       icLoading: false,
       icError: "",
@@ -115,7 +115,7 @@ createApp({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             symbol: this.icSymbol.trim(),
-            start_date: this.icStart.trim() || "20200101",
+            start_date: this.icStart.trim() || "20100101",
             end_date: this.icEnd.trim() || "",
             robust: true,
           }),

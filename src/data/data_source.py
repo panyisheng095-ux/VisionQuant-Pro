@@ -158,7 +158,7 @@ class AkshareDataSource(DataSource):
             symbol = str(symbol).strip().zfill(6)
             
             if start_date is None:
-                start_date = "20200101"
+                start_date = "20100101"
             if end_date is None:
                 end_date = datetime.now().strftime("%Y%m%d")
             
@@ -187,7 +187,7 @@ class AkshareDataSource(DataSource):
         
         try:
             if start_date is None:
-                start_date = "20200101"
+                start_date = "20100101"
             if end_date is None:
                 end_date = datetime.now().strftime("%Y%m%d")
             

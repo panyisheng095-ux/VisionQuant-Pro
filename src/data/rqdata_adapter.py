@@ -111,7 +111,7 @@ class RQDataAdapter(DataSource):
             if start_date:
                 start_date = pd.to_datetime(start_date, format='%Y%m%d')
             else:
-                start_date = datetime(2020, 1, 1)
+                start_date = datetime(2010, 1, 1)
             
             if end_date:
                 end_date = pd.to_datetime(end_date, format='%Y%m%d')
@@ -173,7 +173,7 @@ class RQDataAdapter(DataSource):
             if start_date:
                 start_date = pd.to_datetime(start_date, format='%Y%m%d')
             else:
-                start_date = datetime(2020, 1, 1)
+                start_date = datetime(2010, 1, 1)
             
             if end_date:
                 end_date = pd.to_datetime(end_date, format='%Y%m%d')

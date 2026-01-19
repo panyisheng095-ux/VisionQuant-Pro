@@ -32,7 +32,8 @@ from src.data.data_loader import DataLoader
 
 # 配置
 LABELS_HDF5_PATH = os.path.join(PROJECT_ROOT, "data", "indices", "triple_barrier_labels.h5")
-META_CSV_PATH = os.path.join(PROJECT_ROOT, "data", "indices", "meta_data.csv")
+ATT_META = os.path.join(PROJECT_ROOT, "data", "indices", "meta_data_attention.csv")
+META_CSV_PATH = ATT_META if os.path.exists(ATT_META) else os.path.join(PROJECT_ROOT, "data", "indices", "meta_data.csv")
 MAX_WORKERS = 8  # 多进程数
 
 

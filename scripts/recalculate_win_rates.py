@@ -33,7 +33,8 @@ def recalculate_win_rates():
     print("🚀 开始重新计算历史胜率...")
     
     # 1. 加载元数据
-    meta_csv = os.path.join(PROJECT_ROOT, "data", "indices", "meta_data.csv")
+    attention_meta = os.path.join(PROJECT_ROOT, "data", "indices", "meta_data_attention.csv")
+    meta_csv = attention_meta if os.path.exists(attention_meta) else os.path.join(PROJECT_ROOT, "data", "indices", "meta_data.csv")
     if not os.path.exists(meta_csv):
         print(f"❌ 元数据文件不存在: {meta_csv}")
         return

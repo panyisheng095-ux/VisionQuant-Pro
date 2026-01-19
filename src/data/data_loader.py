@@ -3,6 +3,7 @@ import pandas as pd
 import os
 import time
 import logging
+from collections import OrderedDict
 from tqdm import tqdm
 from datetime import datetime, timedelta
 from typing import Optional
@@ -11,6 +12,7 @@ from typing import Optional
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))
 DATA_RAW_DIR = os.path.join(PROJECT_ROOT, "data", "raw")
+DEFAULT_START_DATE = "20100101"
 
 # 日志（不强行覆盖全局 logging 配置，交由入口处统一配置）
 logger = logging.getLogger(__name__)
@@ -53,6 +55,11 @@ class DataLoader:
         # 初始化数据质量检查器
         self.quality_checker = DataQualityChecker()
         self.enable_quality_check = kwargs.get('enable_quality_check', True)
+
+        # 内存级缓存（减少重复磁盘读）
+        self._mem_cache_enabled = kwargs.get("mem_cache", True)
+        self._mem_cache_max = int(kwargs.get("mem_cache_max", 32))
+        self._mem_cache = OrderedDict()
     
     def _init_data_source(self, source_name: str, **kwargs) -> DataSource:
         """
@@ -95,7 +102,7 @@ class DataLoader:
         """获取当前数据源名称"""
         return self.data_source_name
 
-    def get_stock_data(self, symbol, start_date="20200101", end_date=None, adjust="qfq", use_cache=True):
+    def get_stock_data(self, symbol, start_date=DEFAULT_START_DATE, end_date=None, adjust="qfq", use_cache=True):
         """
         [智能更新版] 获取股票数据（支持多数据源）
         
@@ -111,27 +118,54 @@ class DataLoader:
             adjust: 复权类型
             use_cache: 是否使用本地缓存
         """
-        if end_date is None:
-            end_date = datetime.now().strftime("%Y%m%d")
+        def _to_dt(value, default_dt):
+            if value is None or str(value).strip() == "":
+                return default_dt
+            try:
+                dt = pd.to_datetime(value, errors="coerce")
+                return default_dt if pd.isna(dt) else dt
+            except Exception:
+                return default_dt
+
+        req_start_dt = _to_dt(start_date, pd.to_datetime(DEFAULT_START_DATE))
+        req_end_dt = _to_dt(end_date, pd.to_datetime(datetime.now().strftime("%Y%m%d")))
+        if req_end_dt < req_start_dt:
+            req_end_dt = req_start_dt
+        start_date = req_start_dt.strftime("%Y%m%d")
+        end_date = req_end_dt.strftime("%Y%m%d")
 
         symbol = str(symbol).strip().zfill(6)
         file_path = os.path.join(self.data_dir, f"{symbol}.csv")
 
+        # 内存缓存命中（优先）
+        cache_key = (symbol, start_date, end_date, adjust)
+        if use_cache and self._mem_cache_enabled:
+            cached = self._mem_cache.get(cache_key)
+            if cached is not None:
+                return cached.copy()
+
         need_download = False
-        df = pd.DataFrame()
+        df_cache_all = pd.DataFrame()
 
         # === 1. 检查本地缓存（如果启用） ===
         if use_cache and os.path.exists(file_path):
             try:
-                df = pd.read_csv(file_path, index_col=0, parse_dates=True)
-                if not df.empty:
-                    last_date_in_file = df.index[-1].date()
-                    today = datetime.now().date()
-                    
-                    if last_date_in_file < today:
-                        need_download = True
-                    else:
-                        return df  # 数据已是最新，直接返回
+                df_cache_all = pd.read_csv(file_path, index_col=0, parse_dates=True)
+                df_cache_all = self._normalize_columns(df_cache_all)
+                if not df_cache_all.empty:
+                    df_cache_all.sort_index(inplace=True)
+                    first_date_in_file = pd.to_datetime(df_cache_all.index.min()).normalize()
+                    last_date_in_file = pd.to_datetime(df_cache_all.index.max()).normalize()
+                    need_earlier = req_start_dt < first_date_in_file
+                    need_later = req_end_dt > last_date_in_file
+                    need_download = need_earlier or need_later
+                    if not need_download:
+                        df_out = df_cache_all.loc[req_start_dt:req_end_dt]
+                        if use_cache and self._mem_cache_enabled:
+                            self._mem_cache[cache_key] = df_out
+                            if len(self._mem_cache) > self._mem_cache_max:
+                                self._mem_cache.popitem(last=False)
+                        return df_out.copy()
                 else:
                     need_download = True
             except Exception as e:
@@ -142,62 +176,98 @@ class DataLoader:
 
         # === 2. 从数据源下载（如果需要） ===
         if need_download:
-            # 尝试从当前数据源获取
-            if self.data_source and self.data_source.is_available():
-                print(f"⬇️ [{self.data_source_name}] 正在拉取 {symbol} 最新行情...")
-                df_new = self.data_source.get_stock_data(
-                    symbol=symbol,
-                    start_date=start_date,
-                    end_date=end_date,
-                    adjust=adjust
-                )
-                
-                if df_new is not None and not df_new.empty:
-                    # 数据质量检查
-                    if self.enable_quality_check:
-                        quality_result = self.quality_checker.check_data_quality(df_new, symbol)
-                        if not quality_result['is_valid']:
-                            print(f"⚠️ [{symbol}] 数据质量检查未通过 (得分: {quality_result['score']}/100)")
-                            if quality_result['score'] < 50:
-                                print(f"  错误: {quality_result['errors']}")
-                                # 质量太差：优先使用旧数据；没有旧数据则继续走回退数据源逻辑
-                                if not df.empty:
-                                    return df  # 返回旧数据
-                                df_new = None  # 触发回退
-                    
-                    # 质量不通过且没有旧数据：继续走回退，不在此处保存/返回
-                    if df_new is not None and not df_new.empty:
-                        # 保存到本地缓存
-                        if use_cache:
-                            df_new.to_csv(file_path)
-                        return self._normalize_columns(df_new)
-                else:
-                    print(f"⚠️ [{self.data_source_name}] 获取数据失败，尝试回退...")
-            
-            # 回退到akshare（如果当前不是akshare）
-            if self.data_source_name != 'akshare':
-                print(f"🔄 回退到akshare数据源...")
-                fallback_source = AkshareDataSource()
-                if fallback_source.is_available():
-                    df_new = fallback_source.get_stock_data(
+            def _validate_df(df_new):
+                if df_new is None or df_new.empty:
+                    return None
+                if self.enable_quality_check:
+                    quality_result = self.quality_checker.check_data_quality(df_new, symbol)
+                    if not quality_result['is_valid']:
+                        print(f"⚠️ [{symbol}] 数据质量检查未通过 (得分: {quality_result['score']}/100)")
+                        if quality_result['score'] < 50:
+                            print(f"  错误: {quality_result['errors']}")
+                            return None
+                return df_new
+
+            def _fetch_with_fallback(start_dt, end_dt):
+                if start_dt > end_dt:
+                    return pd.DataFrame()
+                start_str = start_dt.strftime("%Y%m%d")
+                end_str = end_dt.strftime("%Y%m%d")
+                df_new = None
+                # 当前数据源
+                if self.data_source and self.data_source.is_available():
+                    print(f"⬇️ [{self.data_source_name}] 拉取 {symbol} 行情 {start_str}-{end_str}...")
+                    df_new = self.data_source.get_stock_data(
                         symbol=symbol,
-                        start_date=start_date,
-                        end_date=end_date,
+                        start_date=start_str,
+                        end_date=end_str,
                         adjust=adjust
                     )
-                    if df_new is not None and not df_new.empty:
-                        if use_cache:
-                            df_new.to_csv(file_path)
-                        return self._normalize_columns(df_new)
-            
-            # 如果所有数据源都失败，返回旧数据（如果有）
-            if not df.empty:
+                    df_new = _validate_df(df_new)
+                if (df_new is None or df_new.empty) and self.data_source_name != 'akshare':
+                    print(f"🔄 回退到akshare数据源...")
+                    fallback_source = AkshareDataSource()
+                    if fallback_source.is_available():
+                        df_new = fallback_source.get_stock_data(
+                            symbol=symbol,
+                            start_date=start_str,
+                            end_date=end_str,
+                            adjust=adjust
+                        )
+                        df_new = _validate_df(df_new)
+                return df_new if df_new is not None else pd.DataFrame()
+
+            if not df_cache_all.empty:
+                df_cache_all.sort_index(inplace=True)
+                first_date_in_file = pd.to_datetime(df_cache_all.index.min()).normalize()
+                last_date_in_file = pd.to_datetime(df_cache_all.index.max()).normalize()
+                need_earlier = req_start_dt < first_date_in_file
+                need_later = req_end_dt > last_date_in_file
+
+                new_parts = []
+                if need_earlier:
+                    new_parts.append(_fetch_with_fallback(req_start_dt, first_date_in_file - timedelta(days=1)))
+                if need_later:
+                    new_parts.append(_fetch_with_fallback(last_date_in_file + timedelta(days=1), req_end_dt))
+
+                for part in new_parts:
+                    if part is not None and not part.empty:
+                        new_parts_df = self._normalize_columns(part)
+                        df_cache_all = pd.concat([df_cache_all, new_parts_df], axis=0)
+
+                if not df_cache_all.empty:
+                    df_cache_all.sort_index(inplace=True)
+                    df_cache_all = df_cache_all[~df_cache_all.index.duplicated(keep='last')]
+                    if use_cache:
+                        df_cache_all.to_csv(file_path)
+                    df_out = df_cache_all.loc[req_start_dt:req_end_dt]
+                    if use_cache and self._mem_cache_enabled:
+                        self._mem_cache[cache_key] = df_out
+                        if len(self._mem_cache) > self._mem_cache_max:
+                            self._mem_cache.popitem(last=False)
+                    return df_out.copy()
+
+                # 无法获取新数据时，回退旧数据
                 print(f"⚠️ 所有数据源获取失败，使用本地旧数据")
-                return self._normalize_columns(df)
-            
+                df_out = df_cache_all.loc[req_start_dt:req_end_dt] if not df_cache_all.empty else pd.DataFrame()
+                return df_out.copy()
+
+            # 无本地缓存：全量拉取
+            df_new = _fetch_with_fallback(req_start_dt, req_end_dt)
+            if df_new is not None and not df_new.empty:
+                df_new = self._normalize_columns(df_new)
+                if use_cache:
+                    df_new.to_csv(file_path)
+                df_out = df_new.loc[req_start_dt:req_end_dt]
+                if use_cache and self._mem_cache_enabled:
+                    self._mem_cache[cache_key] = df_out
+                    if len(self._mem_cache) > self._mem_cache_max:
+                        self._mem_cache.popitem(last=False)
+                return df_out.copy()
+
             return pd.DataFrame()
 
-        return self._normalize_columns(df)
+        return df_cache_all.loc[req_start_dt:req_end_dt].copy() if not df_cache_all.empty else pd.DataFrame()
 
     def _normalize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -252,7 +322,7 @@ class DataLoader:
             print(f"❌ 获取名单失败: {e}")
             return pd.DataFrame()
 
-    def download_batch_data(self, stock_list, start_date="20200101"):
+    def download_batch_data(self, stock_list, start_date=DEFAULT_START_DATE):
         """批量下载"""
         print(f"⬇️ [批量维护] 正在检查并更新 {len(stock_list)} 只股票...")
         for _, row in tqdm(stock_list.iterrows(), total=len(stock_list)):

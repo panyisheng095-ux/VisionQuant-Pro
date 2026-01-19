@@ -792,7 +792,7 @@ if mode == "🔍 单只股票分析":
 
             cbt1, cbt2, cbt3, cbt4 = st.columns(4)
             with cbt1:
-                bt_start_val = st.date_input("开始日期", value=st.session_state.get("bt_start", datetime(2022, 1, 1)), key="bt_start")
+                bt_start_val = st.date_input("开始日期", value=st.session_state.get("bt_start", datetime(2010, 1, 1)), key="bt_start")
             with cbt2:
                 bt_end_val = st.date_input("结束日期", value=st.session_state.get("bt_end", datetime.now()), key="bt_end")
             with cbt3:

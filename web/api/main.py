@@ -318,13 +318,13 @@ async def audit_log(request: Request, call_next):
 
 class SingleStockRequest(BaseModel):
     symbol: str
-    start_date: str = "20200101"
+    start_date: str = "20100101"
     end_date: str = datetime.now().strftime("%Y%m%d")
 
 
 class FactorRequest(BaseModel):
     symbol: str
-    start_date: str = "20200101"
+    start_date: str = "20100101"
     end_date: str = datetime.now().strftime("%Y%m%d")
     robust: bool = True  # v3.0 新增: 是否使用稳健统计
 
@@ -346,7 +346,7 @@ class VisualSearchRequest(BaseModel):
 class SingleOverviewRequest(BaseModel):
     symbol: str
     visual_win_rate: Optional[float] = None
-    start_date: str = "20200101"
+    start_date: str = "20100101"
     end_date: str = datetime.now().strftime("%Y%m%d")
 
 
