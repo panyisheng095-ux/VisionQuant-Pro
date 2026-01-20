@@ -157,22 +157,34 @@ class FundamentalMiner:
 
     # ... (get_industry_peers, _find_val, _to_f 保持不变，直接复用原有的即可) ...
     # 为了完整性，这里简写保留辅助函数结构
-    def get_industry_peers(self, symbol):
+    def get_industry_peers(self, symbol, max_retries=3):
+        """
+        工业级优化：获取行业和同行对比数据
+        添加重试机制和降级策略
+        """
         symbol = str(symbol).strip().zfill(6)
         if symbol in self._peers_cache:
             return self._peers_cache[symbol]
 
         industry = self._industry_cache.get(symbol)
-        # 1) 个股信息接口（可能不稳定）
+        # 1) 个股信息接口（可能不稳定）- 添加重试机制
         if not industry:
-            try:
-                info_df = ak.stock_individual_info_em(symbol=symbol)
-                if info_df is not None and not info_df.empty and "item" in info_df.columns:
-                    row = info_df[info_df["item"].astype(str).str.contains("行业|所属行业")]
-                    if not row.empty:
-                        industry = str(row["value"].values[0]).strip()
-            except Exception:
-                industry = None
+            for attempt in range(max_retries):
+                try:
+                    info_df = ak.stock_individual_info_em(symbol=symbol)
+                    if info_df is not None and not info_df.empty and "item" in info_df.columns:
+                        row = info_df[info_df["item"].astype(str).str.contains("行业|所属行业")]
+                        if not row.empty:
+                            industry = str(row["value"].values[0]).strip()
+                            break
+                    if attempt < max_retries - 1:
+                        time.sleep(0.5 * (attempt + 1))  # 指数退避
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    print(f"⚠️ 获取个股信息失败 ({symbol}): {e}")
+                    industry = None
 
         # 2) 使用缓存的全市场spot兜底
         dummy = {"_err": []}
@@ -191,9 +203,28 @@ class FundamentalMiner:
             industry = {"60": "上海主板", "00": "深圳主板", "30": "创业板", "68": "科创板"}.get(prefix, "未知")
 
         # 4) 构建同行对比
+        # 工业级优化：如果spot_df为空，尝试重新获取（带重试）
         try:
             if spot_df is None or spot_df.empty:
-                full_market = ak.stock_zh_a_spot_em()
+                # 尝试重新获取全市场数据（带重试）
+                dummy = {"_err": []}
+                full_market = self._get_spot_df_cached(dummy)
+                if full_market is None or full_market.empty:
+                    # 最后尝试直接调用（不带缓存）
+                    for attempt in range(max_retries):
+                        try:
+                            full_market = ak.stock_zh_a_spot_em()
+                            if full_market is not None and not full_market.empty:
+                                break
+                            if attempt < max_retries - 1:
+                                time.sleep(0.5 * (attempt + 1))
+                        except Exception as e:
+                            if attempt < max_retries - 1:
+                                time.sleep(0.5 * (attempt + 1))
+                                continue
+                            print(f"⚠️ 获取全市场数据失败 (尝试{attempt+1}/{max_retries}): {e}")
+                    if full_market is None or full_market.empty:
+                        return industry or "未知", pd.DataFrame()
             else:
                 full_market = spot_df.copy()
 
@@ -210,18 +241,27 @@ class FundamentalMiner:
             peers_df = pd.DataFrame()
             
             # 优先尝试：通过行业名称获取该行业成分股 (修复：紫金矿业匹配银行问题)
+            # 工业级优化：添加重试机制
             if industry and industry not in ["未知", "上海主板", "深圳主板", "创业板", "科创板"]:
-                try:
-                    # 获取行业成分股代码列表
-                    cons_df = ak.stock_board_industry_cons_em(symbol=industry)
-                    if cons_df is not None and not cons_df.empty:
-                        cons_code_col = next((c for c in cons_df.columns if '代码' in c), None)
-                        if cons_code_col:
-                            cons_codes = cons_df[cons_code_col].astype(str).str.zfill(6).tolist()
-                            if cons_codes and code_col:
-                                peers_df = full_market[full_market[code_col].isin(cons_codes)].copy()
-                except Exception as e:
-                    print(f"⚠️ 获取行业成分股失败 ({industry}): {e}")
+                for attempt in range(max_retries):
+                    try:
+                        # 获取行业成分股代码列表
+                        cons_df = ak.stock_board_industry_cons_em(symbol=industry)
+                        if cons_df is not None and not cons_df.empty:
+                            cons_code_col = next((c for c in cons_df.columns if '代码' in c), None)
+                            if cons_code_col:
+                                cons_codes = cons_df[cons_code_col].astype(str).str.zfill(6).tolist()
+                                if cons_codes and code_col:
+                                    peers_df = full_market[full_market[code_col].isin(cons_codes)].copy()
+                                    if not peers_df.empty:
+                                        break  # 成功获取，退出重试循环
+                        if attempt < max_retries - 1:
+                            time.sleep(0.5 * (attempt + 1))  # 指数退避
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            time.sleep(0.5 * (attempt + 1))
+                            continue
+                        print(f"⚠️ 获取行业成分股失败 ({industry}, 尝试{attempt+1}/{max_retries}): {e}")
 
             # 兜底1：如果 spot_df 自带行业列，且上面获取成分股失败
             if peers_df.empty and ind_col and industry not in ["未知", "上海主板", "深圳主板", "创业板", "科创板"]:
