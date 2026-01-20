@@ -176,29 +176,32 @@ def _calculate_factor_values(df_f, symbol, kline_calc, vision_engine, PROJECT_RO
                     figsize=(3, 3), axisoff=True)
 
             # 性能优化：使用快速模式，大幅减少搜索时间
+            # 进一步优化：减少top_k和search_k，减少后续计算量
             matches = vision_engine.search_similar_patterns(
                 temp_img, 
-                top_k=10, 
+                top_k=5,  # 从10降到5，减少后续计算量（因子分析不需要太多match）
                 max_date=date_dt,
                 fast_mode=True,  # 启用快速模式：跳过DTW/相关性计算
-                search_k=500,    # 减少搜索范围
+                search_k=300,    # 从500降到300，进一步减少搜索范围
                 rerank_with_pixels=False,  # 跳过像素重排
-                max_price_checks=50,  # 限制价格检查次数
+                max_price_checks=30,  # 从50降到30，限制价格检查次数
                 use_price_features=False  # 跳过价格特征计算
             )
 
-            # 严格无未来函数：若匹配结果稀少，则使用“同股历史窗口”回退
+            # 严格无未来函数：若匹配结果稀少，则使用"同股历史窗口"回退
             if not matches or len(matches) < 3:
-                matches = _self_match_windows(df_f, symbol, i, top_k=10)
+                matches = _self_match_windows(df_f, symbol, i, top_k=5)  # 从10降到5
 
             if matches and len(matches) > 0:
                 success_count += 1
                 try:
+                    # 性能优化：因子分析不需要enhanced_factor，跳过以节省时间
+                    # 直接计算混合胜率，不计算enhanced_factor（分布估计、情境感知等）
                     factor_result = kline_calc.calculate_hybrid_win_rate(
                         matches,
                         query_symbol=symbol,
                         query_date=date_str,
-                        query_df=df_f.iloc[:i+1]
+                        query_df=None  # 设为None，跳过enhanced_factor计算（节省大量时间）
                     )
                     if isinstance(factor_result, dict):
                         enhanced = factor_result.get("enhanced_factor")
