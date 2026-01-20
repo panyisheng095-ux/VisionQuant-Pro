@@ -1,6 +1,6 @@
 """VisionQuant Pro - 工业级精简版"""
 import streamlit as st
-import os, sys, glob, pandas as pd, numpy as np, mplfinance as mpf, plotly.graph_objects as go
+import os, sys, pandas as pd, numpy as np, mplfinance as mpf, plotly.graph_objects as go
 from datetime import datetime
 import importlib
 import logging
@@ -39,9 +39,16 @@ def _code_version_key():
     ]
     return "|".join([str(os.path.getmtime(p)) if os.path.exists(p) else "0" for p in paths])
 
-def _find_existing_kline_image(symbol: str, date_str: str):
+def _find_existing_kline_image(symbol: str, date_str: str, vision_engine=None):
     symbol = str(symbol).zfill(6)
     date_n = str(date_str).replace("-", "")
+    if vision_engine is not None:
+        try:
+            fast_path = vision_engine.find_image_path(symbol, date_n, allow_nearest=True)
+            if fast_path:
+                return fast_path
+        except Exception:
+            pass
     img_bases = [
         os.path.join(PROJECT_ROOT, "data", "images_v2"),
         os.path.join(PROJECT_ROOT, "data", "images"),
@@ -55,26 +62,7 @@ def _find_existing_kline_image(symbol: str, date_str: str):
         for p in candidates:
             if os.path.exists(p):
                 return p
-        pattern = os.path.join(img_base, "**", f"*{symbol}*{date_n}*.png")
-        matches = glob.glob(pattern, recursive=True)
-        if matches:
-            return matches[0]
-    # 回退：取该股票最新的一张图
-    all_imgs = []
-    for img_base in img_bases:
-        pattern2 = os.path.join(img_base, "**", f"{symbol}*.png")
-        all_imgs.extend(glob.glob(pattern2, recursive=True))
-    if not all_imgs:
-        return None
-    # 尝试按日期排序
-    def _extract_date(p):
-        base = os.path.basename(p).replace(".png", "")
-        parts = base.split("_")
-        if len(parts) >= 2:
-            return parts[1]
-        return "00000000"
-    all_imgs.sort(key=_extract_date, reverse=True)
-    return all_imgs[0]
+    return None
 
 def _render_match_image(symbol: str, date_str: str, loader, out_path: str):
     try:
@@ -183,7 +171,7 @@ def load_all_engines(_code_version: str):
     v = ve_mod.VisionEngine()
     v.reload_index()
     return {
-        "loader": DataLoader(), "vision": v, "factor": FactorMiner(),
+        "loader": DataLoader(mem_cache_max=128), "vision": v, "factor": FactorMiner(),
         "fund": fm_mod.FundamentalMiner(), "agent": QuantAgent(), 
         "news": NewsHarvester(), "audio": AudioManager()
     }
@@ -324,7 +312,7 @@ if mode == "🔍 单只股票分析":
 
             # 优先使用已存在的历史K线图（保证与索引同分布）
             date_str = df.index[-1].strftime("%Y%m%d")
-            q_p = _find_existing_kline_image(symbol, date_str)
+            q_p = _find_existing_kline_image(symbol, date_str, eng.get("vision"))
             if not q_p:
                 q_p = os.path.join(PROJECT_ROOT, "data", "temp_q.png")
                 mc = mpf.make_marketcolors(up='red', down='green', inherit=True)

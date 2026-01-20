@@ -10,7 +10,6 @@ import os
 import time
 import sys
 import base64
-import glob
 import mplfinance as mpf
 
 # 添加项目路径
@@ -67,7 +66,7 @@ def get_vision_engine():
 def get_data_loader():
     global _data_loader
     if _data_loader is None:
-        _data_loader = DataLoader()
+        _data_loader = DataLoader(mem_cache_max=128)
     return _data_loader
 
 
@@ -136,9 +135,16 @@ def _encode_image_b64(img_path: str):
         return None
 
 
-def _find_existing_kline_image(symbol: str, date_str: str):
+def _find_existing_kline_image(symbol: str, date_str: str, vision_engine=None):
     symbol = str(symbol).zfill(6)
     date_n = str(date_str).replace("-", "")
+    if vision_engine is not None:
+        try:
+            fast_path = vision_engine.find_image_path(symbol, date_n, allow_nearest=True)
+            if fast_path:
+                return fast_path
+        except Exception:
+            pass
     img_bases = [
         os.path.join(PROJECT_ROOT, "data", "images_v2"),
         os.path.join(PROJECT_ROOT, "data", "images"),
@@ -152,25 +158,7 @@ def _find_existing_kline_image(symbol: str, date_str: str):
         for p in candidates:
             if os.path.exists(p):
                 return p
-        pattern = os.path.join(img_base, "**", f"*{symbol}*{date_n}*.png")
-        matches = glob.glob(pattern, recursive=True)
-        if matches:
-            return matches[0]
-    # 回退：取该股票最新的一张图
-    all_imgs = []
-    for img_base in img_bases:
-        pattern2 = os.path.join(img_base, "**", f"{symbol}*.png")
-        all_imgs.extend(glob.glob(pattern2, recursive=True))
-    if not all_imgs:
-        return None
-    def _extract_date(p):
-        base = os.path.basename(p).replace(".png", "")
-        parts = base.split("_")
-        if len(parts) >= 2:
-            return parts[1]
-        return "00000000"
-    all_imgs.sort(key=_extract_date, reverse=True)
-    return all_imgs[0]
+    return None
 
 
 def _render_window_kline(window_df: pd.DataFrame, out_path: str):
@@ -590,7 +578,7 @@ def visual_search(req: VisualSearchRequest):
     tag = f"{req.symbol}_{date_str}_{int(time.time())}"
 
     # Query图像：优先使用历史图
-    q_img = _find_existing_kline_image(req.symbol, date_str)
+    q_img = _find_existing_kline_image(req.symbol, date_str, vision)
     if not q_img:
         q_img = _render_window_kline(window_df, os.path.join(tmp_dir, f"query_{tag}.png"))
 

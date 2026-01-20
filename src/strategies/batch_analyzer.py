@@ -1,5 +1,4 @@
 import os
-import glob
 import sys
 import pandas as pd
 import numpy as np
@@ -231,33 +230,30 @@ class BatchAnalyzer:
         return df
 
     def _find_existing_kline_image(self, symbol: str, date_str: str):
-        img_base = os.path.join(PROJECT_ROOT, "data", "images")
+        symbol = str(symbol).zfill(6)
         date_n = str(date_str).replace("-", "")
-        candidates = [
-            os.path.join(img_base, f"{symbol}_{date_n}.png"),
-            os.path.join(img_base, symbol, f"{symbol}_{date_n}.png"),
-            os.path.join(img_base, symbol, f"{date_n}.png"),
+        vision = self.engines.get("vision") if self.engines else None
+        if vision is not None:
+            try:
+                fast_path = vision.find_image_path(symbol, date_n, allow_nearest=True)
+                if fast_path:
+                    return fast_path
+            except Exception:
+                pass
+        img_bases = [
+            os.path.join(PROJECT_ROOT, "data", "images_v2"),
+            os.path.join(PROJECT_ROOT, "data", "images"),
         ]
-        for p in candidates:
-            if os.path.exists(p):
-                return p
-        pattern = os.path.join(img_base, "**", f"*{symbol}*{date_n}*.png")
-        matches = glob.glob(pattern, recursive=True)
-        if matches:
-            return matches[0]
-        # 回退：取该股票最新的一张图
-        pattern2 = os.path.join(img_base, "**", f"{symbol}*.png")
-        all_imgs = glob.glob(pattern2, recursive=True)
-        if not all_imgs:
-            return None
-        def _extract_date(p):
-            base = os.path.basename(p).replace(".png", "")
-            parts = base.split("_")
-            if len(parts) >= 2:
-                return parts[1]
-            return "00000000"
-        all_imgs.sort(key=_extract_date, reverse=True)
-        return all_imgs[0]
+        for img_base in img_bases:
+            candidates = [
+                os.path.join(img_base, f"{symbol}_{date_n}.png"),
+                os.path.join(img_base, symbol, f"{symbol}_{date_n}.png"),
+                os.path.join(img_base, symbol, f"{date_n}.png"),
+            ]
+            for p in candidates:
+                if os.path.exists(p):
+                    return p
+        return None
 
     def _estimate_return(self, win_rate, factor_row):
         """估算预期收益"""

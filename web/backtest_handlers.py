@@ -283,7 +283,10 @@ def _compute_ai_win_strict(symbol, date_str, df, eng, PROJECT_ROOT, fast_mode: b
         from src.strategies.kline_factor import KLineFactorCalculator
         vision = eng["vision"]
         loader = eng["loader"]
-        kline_calc = KLineFactorCalculator(data_loader=loader)
+        kline_calc = eng.get("kline_factor")
+        if kline_calc is None:
+            kline_calc = KLineFactorCalculator(data_loader=loader)
+            eng["kline_factor"] = kline_calc
 
         dt = pd.to_datetime(date_str, format="%Y%m%d", errors="coerce")
         if dt is pd.NaT:
@@ -295,8 +298,11 @@ def _compute_ai_win_strict(symbol, date_str, df, eng, PROJECT_ROOT, fast_mode: b
 
         window_df = df_hist.tail(20)
         query_prices = window_df["Close"].values
-        # 优先使用历史K线图
-        img_path = vision._resolve_image_path(None, symbol, date_str)
+        # 优先使用历史K线图（快速模式允许最近历史图，避免频繁渲染）
+        allow_nearest = bool(fast_mode)
+        img_path = vision.find_image_path(symbol, date_str, allow_nearest=allow_nearest)
+        if not img_path:
+            img_path = vision._resolve_image_path(None, symbol, date_str, allow_nearest=allow_nearest)
         if not img_path:
             tmp_dir = os.path.join(PROJECT_ROOT, "data", "temp_backtest")
             os.makedirs(tmp_dir, exist_ok=True)

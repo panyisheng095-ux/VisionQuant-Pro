@@ -9,6 +9,7 @@ import pickle
 import glob
 import pandas as pd
 import numpy as np
+import bisect
 from datetime import datetime
 from scipy.spatial.distance import cdist
 
@@ -147,6 +148,8 @@ class VisionEngine:
 
         self.index = None
         self.meta_data = []
+        self._path_map = {}
+        self._symbol_dates = {}
         self._pixel_cache = {}
         self._edge_cache = {}
         self._data_loader = None
@@ -219,8 +222,53 @@ class VisionEngine:
             print(f"❌ 元数据文件不存在: {meta_file}")
             return False
 
+        self._build_image_path_index()
+
         print(f"✅ 知识库就绪: {len(self.meta_data)} 条记录")
         return True
+
+    def _build_image_path_index(self):
+        """构建 (symbol, date) -> path 的快速索引，避免递归glob扫描"""
+        self._path_map = {}
+        self._symbol_dates = {}
+        if not self.meta_data:
+            return
+        for info in self.meta_data:
+            sym = str(info.get("symbol", "")).zfill(6)
+            date_str = str(info.get("date", "")).replace("-", "")
+            path = info.get("path")
+            if not sym or not date_str or not path:
+                continue
+            self._path_map[(sym, date_str)] = path
+            try:
+                self._symbol_dates.setdefault(sym, []).append(int(date_str))
+            except Exception:
+                continue
+        for sym, dates in self._symbol_dates.items():
+            dates.sort()
+
+    def find_image_path(self, symbol, date_str, allow_nearest: bool = True):
+        """快速定位图像路径（支持最近历史日期）"""
+        sym = str(symbol).zfill(6)
+        date_n = str(date_str).replace("-", "")
+        if self._path_map:
+            path = self._path_map.get((sym, date_n))
+            if path and os.path.exists(path):
+                return path
+            if allow_nearest:
+                dates = self._symbol_dates.get(sym)
+                try:
+                    target = int(date_n)
+                except Exception:
+                    target = None
+                if dates and target is not None:
+                    idx = bisect.bisect_right(dates, target) - 1
+                    if idx >= 0:
+                        nearest = f"{dates[idx]:08d}"
+                        path = self._path_map.get((sym, nearest))
+                        if path and os.path.exists(path):
+                            return path
+        return None
 
     def _image_to_vector(self, img_path):
         try:
@@ -251,10 +299,14 @@ class VisionEngine:
         except Exception:
             return 0.0
 
-    def _resolve_image_path(self, info_path, symbol, date_str):
-        """从元数据或目录中定位历史K线图片"""
+    def _resolve_image_path(self, info_path, symbol, date_str, allow_nearest: bool = False,
+                            skip_glob_if_indexed: bool = True):
+        """从元数据或目录中定位历史K线图片（避免递归glob带来的大幅耗时）"""
         if info_path and os.path.exists(info_path):
             return info_path
+        path = self.find_image_path(symbol, date_str, allow_nearest=allow_nearest)
+        if path:
+            return path
         date_n = str(date_str).replace("-", "")
         img_bases = [
             os.path.join(PROJECT_ROOT, "data", "images"),
@@ -269,6 +321,9 @@ class VisionEngine:
             for p in candidates:
                 if os.path.exists(p):
                     return p
+        if self._path_map and skip_glob_if_indexed:
+            return None
+        for img_base in img_bases:
             pattern = os.path.join(img_base, "**", f"*{symbol}*{date_n}*.png")
             matches = glob.glob(pattern, recursive=True)
             if matches:
@@ -623,6 +678,7 @@ class VisionEngine:
                 info = self.meta_data[idx]
                 sym = str(info['symbol']).zfill(6)
                 date_str = str(info['date'])
+                path = info.get("path")
                 dt = self._parse_date(date_str)
                 if max_dt and dt and dt > max_dt:
                     continue
@@ -630,12 +686,22 @@ class VisionEngine:
                 # 距离转相似度
                 sim = self._vector_score_to_similarity(vector_score)
                 w = weights.get(scale, 0.0)
-                merged[key] = merged.get(key, 0.0) + sim * w
+                if key in merged:
+                    merged[key]["score"] += sim * w
+                    if not merged[key].get("path") and path:
+                        merged[key]["path"] = path
+                else:
+                    merged[key] = {"score": sim * w, "path": path}
 
         # 相关性增强（仅对日线使用）
         candidates = []
-        for (sym, date_str), score in merged.items():
-            candidates.append({"symbol": sym, "date": date_str, "score": float(score), "path": None})
+        for (sym, date_str), info in merged.items():
+            candidates.append({
+                "symbol": sym,
+                "date": date_str,
+                "score": float(info.get("score", 0.0)),
+                "path": info.get("path")
+            })
 
         # 像素重排（使用日线Query）
         if rerank_with_pixels and candidates and img_paths.get("daily"):
@@ -643,7 +709,7 @@ class VisionEngine:
             if q_vec is not None:
                 q_edge = self._load_edge_vector(img_paths.get("daily"))
                 for c in candidates[:min(len(candidates), rerank_top_k)]:
-                    img_path = self._resolve_image_path(None, c["symbol"], c["date"])
+                    img_path = c.get("path") or self._resolve_image_path(None, c["symbol"], c["date"])
                     v = self._load_pixel_vector(img_path)
                     e = self._load_edge_vector(img_path)
                     pix_cos = self._cosine_sim(q_vec, v)
