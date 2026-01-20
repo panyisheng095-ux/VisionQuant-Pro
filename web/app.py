@@ -169,7 +169,8 @@ def load_all_engines(_code_version: str):
     importlib.reload(ve_mod)
     importlib.reload(fm_mod)
     v = ve_mod.VisionEngine()
-    v.reload_index()
+    # 延迟加载索引：只在第一次搜索时加载，避免启动时20-30分钟的等待
+    # v.reload_index()  # 已移除：索引将在第一次调用search_similar_patterns时自动加载
     return {
         "loader": DataLoader(mem_cache_max=128), "vision": v, "factor": FactorMiner(),
         "fund": fm_mod.FundamentalMiner(), "agent": QuantAgent(), 

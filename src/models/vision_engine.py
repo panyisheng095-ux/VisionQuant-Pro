@@ -207,22 +207,35 @@ class VisionEngine:
 
         print(f"📥 [VisionEngine] 加载索引: {os.path.basename(index_file)}")
         try:
+            import time
+            start_time = time.time()
             self.index = faiss.read_index(index_file)
+            print(f"  ⏱️  FAISS索引加载耗时: {time.time() - start_time:.1f}秒")
         except Exception as e:
             print(f"❌ FAISS 加载失败: {e}")
             return False
 
         if os.path.exists(meta_file):
-            df = pd.read_csv(meta_file, dtype=str)
+            import time
+            start_time = time.time()
+            # 优化：使用更快的CSV读取参数
+            df = pd.read_csv(meta_file, dtype=str, engine='c', low_memory=False)
             self.meta_data = df.to_dict('records')
+            print(f"  ⏱️  元数据CSV加载耗时: {time.time() - start_time:.1f}秒 ({len(self.meta_data)}条记录)")
         elif os.path.exists(META_PKL):
+            import time
+            start_time = time.time()
             with open(META_PKL, 'rb') as f:
                 self.meta_data = pickle.load(f)
+            print(f"  ⏱️  元数据PKL加载耗时: {time.time() - start_time:.1f}秒")
         else:
             print(f"❌ 元数据文件不存在: {meta_file}")
             return False
 
+        import time
+        start_time = time.time()
         self._build_image_path_index()
+        print(f"  ⏱️  路径索引构建耗时: {time.time() - start_time:.1f}秒")
 
         print(f"✅ 知识库就绪: {len(self.meta_data)} 条记录")
         return True
