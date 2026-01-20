@@ -25,15 +25,17 @@ def show_factor_analysis(symbol, df_f, eng, PROJECT_ROOT):
 
     try:
         logger.info(f"开始因子分析: {symbol}")
-        from src.factor_analysis.ic_analysis import ICAnalyzer
-        from src.factor_analysis.regime_detector import RegimeDetector
-        from src.strategies.kline_factor import KLineFactorCalculator
-        from src.factor_analysis.factor_invalidation import FactorInvalidationDetector
+        # 性能优化提示
+        with st.spinner("🚀 正在计算因子值（性能优化版，预计2-5分钟）..."):
+            from src.factor_analysis.ic_analysis import ICAnalyzer
+            from src.factor_analysis.regime_detector import RegimeDetector
+            from src.strategies.kline_factor import KLineFactorCalculator
+            from src.factor_analysis.factor_invalidation import FactorInvalidationDetector
 
-        kline_calc = KLineFactorCalculator(data_loader=eng.get("loader"))
-        factor_values, forward_returns, dates, horizon_returns, success_count, fail_count = _calculate_factor_values(
-            df_f, symbol, kline_calc, eng["vision"], PROJECT_ROOT, horizons=[1, 5, 10, 20]
-        )
+            kline_calc = KLineFactorCalculator(data_loader=eng.get("loader"))
+            factor_values, forward_returns, dates, horizon_returns, success_count, fail_count = _calculate_factor_values(
+                df_f, symbol, kline_calc, eng["vision"], PROJECT_ROOT, horizons=[1, 5, 10, 20]
+            )
 
         if len(factor_values) < 20:
             st.warning(f"数据不足，需要至少20个有效数据点（当前 {len(factor_values)}）")
@@ -111,32 +113,35 @@ def show_factor_analysis(symbol, df_f, eng, PROJECT_ROOT):
 
 def _calculate_factor_values(df_f, symbol, kline_calc, vision_engine, PROJECT_ROOT, horizons=None):
     """
-    计算历史因子值
+    计算历史因子值（性能优化版）
 
     通过遍历历史数据，为每个时间点计算K线学习因子值
+    优化：使用快速模式、减少样本数、添加进度提示
     """
+    import streamlit as st
+    
     if horizons is None:
         horizons = [1, 5, 10, 20]
     factor_values, forward_returns, dates = [], [], []
     horizon_returns = {h: [] for h in horizons}
 
-    # 覆盖全区间 + 提升样本量（科学性优先）
+    # 覆盖全区间 + 性能优化：减少样本数
     end_idx = len(df_f) - 6  # 需要 i+5 可取
     if end_idx <= 20:
         return factor_values, forward_returns, dates, horizon_returns, 0, 0
 
     total_points = end_idx - 20 + 1
-    # 目标样本数：尽量多，但上限600（兼顾性能）
-    target_points = min(600, total_points)
+    # 性能优化：目标样本数从600降到200（兼顾速度和科学性）
+    target_points = min(200, total_points)
     # 自适应步长：数据越长，步长越大
-    if total_points <= 300:
+    if total_points <= 200:
         step = 1
-    elif total_points <= 600:
+    elif total_points <= 400:
         step = 2
-    elif total_points <= 1200:
-        step = 3
+    elif total_points <= 800:
+        step = 4
     else:
-        step = max(1, total_points // target_points)
+        step = max(2, total_points // target_points)
     sample_idx = list(range(20, end_idx + 1, step))
     # 兜底避免过多
     if len(sample_idx) > target_points:
@@ -144,8 +149,13 @@ def _calculate_factor_values(df_f, symbol, kline_calc, vision_engine, PROJECT_RO
 
     success_count = 0
     fail_count = 0
+    
+    # 添加进度条
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    total_iters = len(sample_idx)
 
-    for i in sample_idx:
+    for idx, i in enumerate(sample_idx):
         try:
             current_data = df_f.iloc[i-20:i]
             if len(current_data) < 20:
@@ -154,13 +164,28 @@ def _calculate_factor_values(df_f, symbol, kline_calc, vision_engine, PROJECT_RO
             date_dt = df_f.index[i]
             date_str = _safe_date_str(date_dt)
 
+            # 更新进度
+            progress = (idx + 1) / total_iters
+            progress_bar.progress(progress)
+            status_text.text(f"计算因子值: {idx + 1}/{total_iters} ({progress*100:.1f}%)")
+            
             temp_img = os.path.join(PROJECT_ROOT, "data", f"temp_factor_{i}.png")
             mc = mpf.make_marketcolors(up='red', down='green', inherit=True)
             s = mpf.make_mpf_style(marketcolors=mc, gridstyle='')
             mpf.plot(current_data, type='candle', style=s, savefig=dict(fname=temp_img, dpi=50),
                     figsize=(3, 3), axisoff=True)
 
-            matches = vision_engine.search_similar_patterns(temp_img, top_k=10, max_date=date_dt)
+            # 性能优化：使用快速模式，大幅减少搜索时间
+            matches = vision_engine.search_similar_patterns(
+                temp_img, 
+                top_k=10, 
+                max_date=date_dt,
+                fast_mode=True,  # 启用快速模式：跳过DTW/相关性计算
+                search_k=500,    # 减少搜索范围
+                rerank_with_pixels=False,  # 跳过像素重排
+                max_price_checks=50,  # 限制价格检查次数
+                use_price_features=False  # 跳过价格特征计算
+            )
 
             # 严格无未来函数：若匹配结果稀少，则使用“同股历史窗口”回退
             if not matches or len(matches) < 3:
@@ -210,13 +235,18 @@ def _calculate_factor_values(df_f, symbol, kline_calc, vision_engine, PROJECT_RO
         except Exception:
             fail_count += 1
             continue
+    
+    # 清理进度条
+    progress_bar.empty()
+    status_text.empty()
 
     return factor_values, forward_returns, dates, horizon_returns, success_count, fail_count
 
 
-def _self_match_windows(df_f, symbol, idx, window: int = 20, top_k: int = 10, max_windows: int = 200):
+def _self_match_windows(df_f, symbol, idx, window: int = 20, top_k: int = 10, max_windows: int = 100):
     """
-    回退方案：仅在“同一股票历史窗口”内做形态相似度（无未来函数）
+    回退方案：仅在"同一股票历史窗口"内做形态相似度（无未来函数）
+    性能优化：减少最大窗口数，使用更快的相关性计算
     """
     try:
         if idx <= window:
@@ -225,7 +255,7 @@ def _self_match_windows(df_f, symbol, idx, window: int = 20, top_k: int = 10, ma
         if len(q_prices) < window:
             return []
 
-        # 控制窗口数量
+        # 性能优化：减少窗口数量（从200降到100）
         start = window
         end = idx
         total = end - start
@@ -233,14 +263,22 @@ def _self_match_windows(df_f, symbol, idx, window: int = 20, top_k: int = 10, ma
             return []
         step = max(1, total // max_windows)
 
-        q_norm = (q_prices - q_prices.mean()) / (q_prices.std() + 1e-8)
+        # 性能优化：预计算归一化查询价格
+        q_mean = q_prices.mean()
+        q_std = q_prices.std() + 1e-8
+        q_norm = (q_prices - q_mean) / q_std
+        
         candidates = []
         for j in range(start, end, step):
             cand = df_f.iloc[j - window: j]["Close"].values
             if len(cand) < window:
                 continue
-            c_norm = (cand - cand.mean()) / (cand.std() + 1e-8)
-            corr = np.corrcoef(q_norm, c_norm)[0, 1]
+            # 性能优化：使用更快的相关性计算
+            c_mean = cand.mean()
+            c_std = cand.std() + 1e-8
+            c_norm = (cand - c_mean) / c_std
+            # 使用点积计算相关性（比corrcoef快）
+            corr = np.dot(q_norm, c_norm) / window
             if np.isnan(corr):
                 corr = 0.0
             sim = (corr + 1.0) / 2.0
