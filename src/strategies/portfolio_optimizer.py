@@ -1,6 +1,8 @@
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from multiprocessing import cpu_count
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -305,24 +307,50 @@ class PortfolioOptimizer:
         return confs
 
     def _calculate_covariance_matrix(self, symbols, loader):
-        """计算协方差矩阵"""
+        """计算协方差矩阵（并行拉取，增强鲁棒性）"""
+        if not symbols:
+            return None
+
         prices = pd.DataFrame()
-        
-        for sym in symbols:
-            df = loader.get_stock_data(sym)
-            if not df.empty:
-                prices[sym] = df['Close']
-        
+
+        def _fetch_prices(sym: str):
+            try:
+                df = loader.get_stock_data(sym)
+                if df is None or df.empty or "Close" not in df.columns:
+                    return sym, None
+                series = df["Close"].astype(float)
+                series.name = sym
+                return sym, series
+            except Exception:
+                return sym, None
+
+        max_workers = min(max(1, cpu_count() * 2), 8, len(symbols))
+        if max_workers > 1:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(_fetch_prices, s): s for s in symbols}
+                for future in as_completed(futures):
+                    sym, series = future.result()
+                    if series is not None:
+                        prices[sym] = series
+        else:
+            for sym in symbols:
+                _, series = _fetch_prices(sym)
+                if series is not None:
+                    prices[sym] = series
+
         if prices.empty:
             return None
-            
-        # 计算日收益率
-        returns = prices.pct_change().dropna()
-        
-        if len(returns) < 30:  # 样本太少
+
+        # 如果缺失过多，避免维度不一致引发优化失败
+        if prices.shape[1] != len(symbols):
             return None
-            
-        # 计算协方差矩阵
+
+        # 计算日收益率
+        returns = prices.pct_change().dropna(how="all")
+        returns = returns.dropna(axis=1, how="all")
+        if returns.empty or len(returns) < 30:
+            return None
+
         cov_matrix = returns.cov().values
         return cov_matrix
 

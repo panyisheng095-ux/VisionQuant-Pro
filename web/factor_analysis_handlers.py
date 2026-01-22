@@ -74,6 +74,21 @@ def show_factor_analysis(symbol, df_f, eng, PROJECT_ROOT):
         ic_analyzer = ICAnalyzer(window=window)
         # v3.0: 开启稳健统计 (Winsorization)
         ic_result = ic_analyzer.analyze(factor_series, returns_series, method="pearson")
+        # 缓存IC摘要，供AI终审使用
+        try:
+            summary = ic_result.get("summary", {})
+            payload = {
+                "mean_ic": summary.get("mean_ic"),
+                "ir": summary.get("ir"),
+                "positive_ratio": summary.get("positive_ratio"),
+                "significant": summary.get("significant"),
+                "samples": len(factor_series),
+            }
+            if "ic_summary" not in st.session_state:
+                st.session_state.ic_summary = {}
+            st.session_state.ic_summary[symbol] = payload
+        except Exception:
+            pass
         # 多持有期IC矩阵
         try:
             horizon_series = {}

@@ -187,6 +187,7 @@ if "batch_results" not in st.session_state: st.session_state.batch_results = {}
 if "portfolio_weights" not in st.session_state: st.session_state.portfolio_weights = {}
 if "portfolio_metrics" not in st.session_state: st.session_state.portfolio_metrics = {}
 if "current_symbol" not in st.session_state: st.session_state.current_symbol = None
+if "ic_summary" not in st.session_state: st.session_state.ic_summary = {}
 
 # URL 跳转预处理：先写入 session_state，让侧边栏控件同步
 url_symbol = st.query_params.get("symbol")
@@ -442,27 +443,17 @@ if mode == "🔍 单只股票分析":
             progress.progress(95)
 
             returns = df['Close'].pct_change().dropna()
-            try:
-                regime_weights = eng.get("regime_manager", None)
-                if regime_weights:
-                    regime_weights = regime_weights.calculate_dynamic_weights(returns=returns)
-                    dynamic_weights = regime_weights.get('weights', {})
-                else:
-                    dynamic_weights = None
-            except:
-                dynamic_weights = None
-            
-            if dynamic_weights:
-                total_score, initial_action, s_details = eng["factor"].get_scorecard(
-                    win_rate_for_score, df_f.iloc[-1], fund_data, returns=returns
-                )
-            else:
-                total_score, initial_action, s_details = eng["factor"].get_scorecard(
-                    win_rate_for_score, df_f.iloc[-1], fund_data
-                )
+            total_score, initial_action, s_details = eng["factor"].get_scorecard(
+                win_rate_for_score, df_f.iloc[-1], fund_data, returns=returns if not returns.empty else None
+            )
 
-            report = eng["agent"].analyze(symbol, total_score, initial_action, {"win_rate": win_rate, "score": 0.9},
-                                          df_f.iloc[-1].to_dict(), fund_data, news_text)
+            ic_summary = (st.session_state.get("ic_summary") or {}).get(symbol)
+            report = eng["agent"].analyze(
+                symbol, total_score, initial_action,
+                {"win_rate": win_rate, "score": 0.9},
+                df_f.iloc[-1].to_dict(), fund_data, news_text,
+                ic_summary=ic_summary
+            )
 
             c_p = os.path.join(PROJECT_ROOT, "data", "comparison.png")
             create_comparison_plot(q_p, matches, c_p)
@@ -492,6 +483,10 @@ if mode == "🔍 单只股票分析":
             st.session_state.res = res_dict
             progress.progress(100)
             status.empty()
+            ic_summary_txt = ""
+            if ic_summary:
+                ic_summary_txt = f"IC均值: {ic_summary.get('mean_ic')} | IR: {ic_summary.get('ir')} | 显著性: {ic_summary.get('significant')}"
+
             st.session_state.last_context = f"""
             股票名称: {stock_name} ({symbol})
             当前时间: {datetime.now().strftime('%Y-%m-%d')}
@@ -499,6 +494,7 @@ if mode == "🔍 单只股票分析":
             AI评分: {total_score}/10
             趋势信号: {initial_action}
             形态胜率: {win_rate:.1f}%
+            IC摘要: {ic_summary_txt}
             --- 财务数据 ---
             ROE: {fund_data.get('roe')}%
             PE(TTM): {fund_data.get('pe_ttm')}
@@ -721,6 +717,15 @@ if mode == "🔍 单只股票分析":
 
             # 解释性评分（V/F/Q贡献）
             det = d.get("det", {})
+            if det.get("视觉权重") is not None or det.get("regime"):
+                with st.expander("🧭 Regime 动态权重", expanded=False):
+                    st.write(f"当前Regime: {det.get('regime', 'N/A')}")
+                    weights_df = pd.DataFrame([
+                        {"因子": "视觉(V)", "权重": det.get("视觉权重", "N/A")},
+                        {"因子": "基本面(F)", "权重": det.get("财务权重", "N/A")},
+                        {"因子": "技术(Q)", "权重": det.get("量化权重", "N/A")},
+                    ])
+                    st.dataframe(weights_df, use_container_width=True, hide_index=True)
             try:
                 v = float(det.get("视觉分(V)", 0))
                 f = float(det.get("财务分(F)", 0))
@@ -736,17 +741,6 @@ if mode == "🔍 单只股票分析":
             except Exception:
                 pass
 
-            # 收益归因（视觉/技术/基本面）
-            try:
-                attribution = pd.DataFrame([
-                    {"来源": "视觉因子", "影响": round(v, 2)},
-                    {"来源": "技术因子", "影响": round(q, 2)},
-                    {"来源": "基本面因子", "影响": round(f, 2)},
-                ])
-                with st.expander("📌 收益归因（因子贡献）", expanded=False):
-                    st.dataframe(attribution, use_container_width=True, hide_index=True)
-            except Exception:
-                pass
 
         with c_right:
             st.subheader(f"3. 行业对标 ({d['ind']})")

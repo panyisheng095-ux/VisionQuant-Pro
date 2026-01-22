@@ -13,6 +13,14 @@ class FundamentalMiner:
         self._spot_retry = spot_retry
         self._industry_cache = {}
         self._peers_cache = {}
+        self._industry_map = {}
+        self._industry_cons_cache = {}
+        self._industry_map_ts = 0.0
+        self._industry_map_ttl_sec = 24 * 3600
+        self._industry_board_names = []
+        self._industry_board_ts = 0.0
+        self._industry_board_ttl_sec = 24 * 3600
+        self._industry_name_cache = {}
 
     def get_stock_fundamentals(self, symbol):
         """
@@ -50,9 +58,21 @@ class FundamentalMiner:
                     if code_col:
                         target = spot_df[spot_df[code_col] == symbol]
                         if not target.empty:
-                            pe_col = next((c for c in target.columns if '市盈率' in c and '动' in c), None)
-                            pb_col = next((c for c in target.columns if '市净率' in c), None)
-                            mv_col = next((c for c in target.columns if '总市值' in c), None)
+                            def _pick_col(cols, keywords, prefer=None):
+                                prefer = prefer or []
+                                # 优先匹配含 prefer 的列
+                                for c in cols:
+                                    if all(k in str(c) for k in prefer):
+                                        return c
+                                for c in cols:
+                                    if any(k in str(c) for k in keywords):
+                                        return c
+                                return None
+
+                            cols = list(target.columns)
+                            pe_col = _pick_col(cols, ["市盈率", "PE", "pe", "TTM"], prefer=["市盈率", "TTM"])
+                            pb_col = _pick_col(cols, ["市净率", "PB", "pb"])
+                            mv_col = _pick_col(cols, ["总市值", "市值"])
                             name_col = next((c for c in target.columns if '名称' in c), None)
 
                             if pe_col:
@@ -102,6 +122,22 @@ class FundamentalMiner:
                             time.sleep(0.5 * (attempt + 1))
                             continue
                         result["_err"].append(f"stock_individual_info_error: {type(e).__name__}: {e}")
+
+            # 1.5 估值指标兜底：从指标接口补齐 PE/PB/市值
+            if (result.get("pe_ttm", 0) == 0 or result.get("pb", 0) == 0 or result.get("total_mv", 0) == 0):
+                try:
+                    extra = self._get_indicator_snapshot(symbol, max_retries=max(1, self._spot_retry))
+                    if extra:
+                        if result.get("pe_ttm", 0) == 0 and extra.get("pe_ttm") is not None:
+                            result["pe_ttm"] = extra.get("pe_ttm", 0.0)
+                        if result.get("pb", 0) == 0 and extra.get("pb") is not None:
+                            result["pb"] = extra.get("pb", 0.0)
+                        if result.get("total_mv", 0) == 0 and extra.get("total_mv") is not None:
+                            result["total_mv"] = extra.get("total_mv", 0.0)
+                        if extra.get("ok"):
+                            result["_ok"]["spot"] = True
+                except Exception as e:
+                    result["_err"].append(f"indicator_fallback_error: {type(e).__name__}: {e}")
 
             # 2. 深度指标：优先使用 THS 财务摘要（经验证可用；EM接口在你环境里全量报错）
             # 工业级优化：添加重试机制
@@ -162,6 +198,11 @@ class FundamentalMiner:
                 # 只作为兜底推算，不写入 _ok.finance
                 result["_err"].append("roe_estimated_by_pb_pe")
 
+            # 4. 最终兜底：若估值字段已取得，补标 spot OK
+            if not result["_ok"]["spot"]:
+                if (result.get("pe_ttm", 0) or result.get("pb", 0) or result.get("total_mv", 0)):
+                    result["_ok"]["spot"] = True
+
         except Exception as e:
             result["_err"].append(f"spot_error: {type(e).__name__}: {e}")
             print(f"⚠️ 财报异常: {e}")
@@ -199,6 +240,155 @@ class FundamentalMiner:
 
         if last_err is not None:
             result["_err"].append(f"spot_retry_failed (尝试{max_retries}次): {type(last_err).__name__}: {last_err}")
+        return None
+
+    def _get_indicator_snapshot(self, symbol: str, max_retries: int = 2):
+        """
+        估值指标兜底：尝试从 A 股指标接口提取 PE/PB/市值
+        """
+        symbol = str(symbol).strip().zfill(6)
+
+        def _pick_col(df, keywords):
+            cols = list(df.columns)
+            for c in cols:
+                c_low = str(c).lower()
+                for kw in keywords:
+                    kw_low = kw.lower()
+                    if kw_low in c_low or kw in str(c):
+                        return c
+            return None
+
+        fetchers = []
+        if hasattr(ak, "stock_a_indicator_lg"):
+            fetchers.append(ak.stock_a_indicator_lg)
+        if hasattr(ak, "stock_zh_a_indicator"):
+            fetchers.append(ak.stock_zh_a_indicator)
+        if hasattr(ak, "stock_a_indicator"):
+            fetchers.append(ak.stock_a_indicator)
+
+        for fetch in fetchers:
+            for attempt in range(max_retries):
+                try:
+                    df = fetch(symbol=symbol)
+                    if df is None or df.empty:
+                        continue
+                    # 取最新记录
+                    if "trade_date" in df.columns:
+                        df = df.sort_values("trade_date")
+                    latest = df.iloc[-1]
+                    pe_col = _pick_col(df, ["pe_ttm", "市盈率", "PE", "TTM"])
+                    pb_col = _pick_col(df, ["pb", "市净率", "PB"])
+                    mv_col = _pick_col(df, ["total_mv", "总市值", "市值", "流通市值"])
+                    pe_ttm = self._to_f(latest.get(pe_col)) if pe_col else None
+                    pb = self._to_f(latest.get(pb_col)) if pb_col else None
+                    total_mv = self._to_f(latest.get(mv_col)) if mv_col else None
+                    ok = any([pe_ttm, pb, total_mv])
+                    return {"pe_ttm": pe_ttm, "pb": pb, "total_mv": total_mv, "ok": ok}
+                except Exception:
+                    if attempt < max_retries - 1:
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+        return None
+
+    def _get_industry_board_names(self, max_retries: int = 2):
+        now = time.time()
+        if self._industry_board_names and (now - self._industry_board_ts) < self._industry_board_ttl_sec:
+            return self._industry_board_names
+        sources = []
+        if hasattr(ak, "stock_board_industry_name_em"):
+            sources.append(ak.stock_board_industry_name_em)
+        if hasattr(ak, "stock_board_industry_name_ths"):
+            sources.append(ak.stock_board_industry_name_ths)
+        if not sources:
+            return []
+        for fetch in sources:
+            for attempt in range(max_retries):
+                try:
+                    df = fetch()
+                    if df is None or df.empty:
+                        continue
+                    name_col = next((c for c in df.columns if "板块" in c or "行业" in c or "名称" in c), None)
+                    if not name_col:
+                        name_col = df.columns[0]
+                    names = [str(x).strip() for x in df[name_col].dropna().tolist() if str(x).strip()]
+                    if names:
+                        self._industry_board_names = names
+                        self._industry_board_ts = now
+                        return names
+                except Exception:
+                    if attempt < max_retries - 1:
+                        time.sleep(0.3 * (attempt + 1))
+                        continue
+        return []
+
+    def _normalize_industry_name(self, name: str):
+        if not name:
+            return ""
+        n = str(name).strip()
+        # 去掉括号内容（如 “计算机设备(申万)”）
+        for sep in ["(", "（"]:
+            if sep in n:
+                n = n.split(sep)[0].strip()
+        return n
+
+    def _match_industry_board_name(self, industry: str):
+        if not industry:
+            return None
+        industry = self._normalize_industry_name(industry)
+        names = self._get_industry_board_names()
+        if not names:
+            return None
+        # 优先完全匹配
+        for name in names:
+            if industry == self._normalize_industry_name(name):
+                return name
+        # 其次包含匹配
+        for name in names:
+            norm = self._normalize_industry_name(name)
+            if industry in norm or norm in industry:
+                return name
+        return None
+
+    def _lookup_industry_from_boards(self, symbol: str, max_retries: int = 2, max_scan: int = 200):
+        symbol = str(symbol).strip().zfill(6)
+        now = time.time()
+        if symbol in self._industry_map and (now - self._industry_map_ts) < self._industry_map_ttl_sec:
+            return self._industry_map[symbol]
+        if not hasattr(ak, "stock_board_industry_cons_em"):
+            return None
+
+        names = self._get_industry_board_names()
+        if not names:
+            return None
+
+        scanned = 0
+        for name in names:
+            scanned += 1
+            if max_scan and scanned > max_scan:
+                break
+            codes = self._industry_cons_cache.get(name)
+            if codes is None:
+                cons_df = None
+                for attempt in range(max_retries):
+                    try:
+                        cons_df = ak.stock_board_industry_cons_em(symbol=name)
+                        if cons_df is not None and not cons_df.empty:
+                            break
+                    except Exception:
+                        if attempt < max_retries - 1:
+                            time.sleep(0.3 * (attempt + 1))
+                            continue
+                if cons_df is None or cons_df.empty:
+                    continue
+                code_col = next((c for c in cons_df.columns if "代码" in c or "证券代码" in c or "stock_code" in c), None)
+                if not code_col:
+                    continue
+                codes = set(cons_df[code_col].astype(str).str.zfill(6).tolist())
+                self._industry_cons_cache[name] = codes
+            if symbol in codes:
+                self._industry_map[symbol] = name
+                self._industry_map_ts = now
+                return name
         return None
 
     # ... (get_industry_peers, _find_val, _to_f 保持不变，直接复用原有的即可) ...
@@ -242,6 +432,10 @@ class FundamentalMiner:
                 row = spot_df[spot_df[code_col].astype(str).str.zfill(6) == symbol]
                 if not row.empty:
                     industry = str(row[ind_col].values[0]).strip()
+
+        # 2.5) 行业兜底：从行业板块成分反查
+        if not industry or industry == "未知":
+            industry = self._lookup_industry_from_boards(symbol, max_retries=max_retries)
 
         # 3) 最后兜底：板块按代码前缀
         if not industry:
@@ -292,9 +486,16 @@ class FundamentalMiner:
                 for attempt in range(max_retries):
                     try:
                         # 获取行业成分股代码列表
-                        cons_df = ak.stock_board_industry_cons_em(symbol=industry)
+                        board_name = self._match_industry_board_name(industry) or industry
+                        cons_df = None
+                        if hasattr(ak, "stock_board_industry_cons_em"):
+                            cons_df = ak.stock_board_industry_cons_em(symbol=board_name)
+                        if (cons_df is None or cons_df.empty) and hasattr(ak, "stock_board_industry_cons_ths"):
+                            cons_df = ak.stock_board_industry_cons_ths(symbol=board_name)
+                        if (cons_df is None or cons_df.empty) and hasattr(ak, "stock_board_industry_cons_sina"):
+                            cons_df = ak.stock_board_industry_cons_sina(symbol=board_name)
                         if cons_df is not None and not cons_df.empty:
-                            cons_code_col = next((c for c in cons_df.columns if '代码' in c), None)
+                            cons_code_col = next((c for c in cons_df.columns if '代码' in c or '证券代码' in c or 'stock_code' in c), None)
                             if cons_code_col:
                                 cons_codes = cons_df[cons_code_col].astype(str).str.zfill(6).tolist()
                                 if cons_codes and code_col:
@@ -311,7 +512,8 @@ class FundamentalMiner:
 
             # 兜底1：如果 spot_df 自带行业列，且上面获取成分股失败
             if peers_df.empty and ind_col and industry not in ["未知", "上海主板", "深圳主板", "创业板", "科创板"]:
-                peers_df = full_market[full_market[ind_col] == industry].copy()
+                norm_ind = self._normalize_industry_name(industry)
+                peers_df = full_market[full_market[ind_col].astype(str).apply(self._normalize_industry_name) == norm_ind].copy()
             
             # 移除粗暴的板块前缀兜底，避免将紫金矿业（有色）匹配为市值最高的银行股
             # if peers_df.empty:
@@ -320,7 +522,7 @@ class FundamentalMiner:
             if peers_df.empty:
                 # 如果找不到同行，尝试用全部A股的同名行业（如果spot里有行业列但没匹配上）
                 if ind_col and industry:
-                     peers_df = full_market[full_market[ind_col].str.contains(industry, na=False)].copy()
+                     peers_df = full_market[full_market[ind_col].astype(str).str.contains(self._normalize_industry_name(industry), na=False)].copy()
                 
                 if peers_df.empty:
                     return industry, pd.DataFrame()

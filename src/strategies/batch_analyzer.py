@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import mplfinance as mpf
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from multiprocessing import cpu_count
 from datetime import datetime
 from tqdm import tqdm
 
@@ -26,7 +27,8 @@ class BatchAnalyzer:
         from src.strategies.kline_factor import KLineFactorCalculator
         
         self.engines = engines
-        self.max_workers = 8  # 控制并发，避免API限流
+        # 控制并发，避免API限流
+        self.max_workers = min(max(4, cpu_count()), 16)
         self._data_cache = {}  # 简易缓存，加速批量
         
         # K线因子计算器（混合胜率）
@@ -65,7 +67,8 @@ class BatchAnalyzer:
         results = {}
         total = len(symbols)
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        max_workers = min(self.max_workers, total) if total > 0 else 1
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(self._analyze_single_fast, sym): sym
                 for sym in symbols
@@ -112,6 +115,7 @@ class BatchAnalyzer:
             if today_key in self.prediction_cache:
                 win_rate = float(self.prediction_cache[today_key])
                 matches = []
+                win_rate_result = None
             else:
                 # 视觉搜索（简化：只取Top-10，不生成对比图）
                 date_str = df.index[-1].strftime("%Y%m%d")
@@ -125,7 +129,7 @@ class BatchAnalyzer:
 
                 matches = self.engines["vision"].search_similar_patterns(q_p, top_k=10)
 
-            # 4. 混合胜率计算（Triple Barrier + 传统胜率）+ 复合因子
+                # 4. 混合胜率计算（Triple Barrier + 传统胜率）+ 复合因子
                 win_rate_result = self.kline_factor_calc.calculate_hybrid_win_rate(
                     matches,
                     query_symbol=symbol,
@@ -134,6 +138,7 @@ class BatchAnalyzer:
                 )
                 enhanced = win_rate_result.get("enhanced_factor") if isinstance(win_rate_result, dict) else None
                 win_rate = enhanced.get("final_score") if isinstance(enhanced, dict) and enhanced.get("final_score") is not None else win_rate_result.get('hybrid_win_rate', 50.0)
+
             dist = self.kline_factor_calc.calculate_return_distribution(
                 matches,
                 horizon_days=20,

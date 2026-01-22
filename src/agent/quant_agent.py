@@ -53,10 +53,14 @@ class QuantAgent:
         [舆情]
         {news_summary}
 
+        [因子有效性]
+        {ic_summary}
+
         【决策逻辑】
         1. **一票否决**：若 ROE<0 或 PE>60，或者新闻有重大利空（立案/调查），强制 **SELL/WAIT**。
         2. **趋势共振**：只有当 形态胜率>60% 且 趋势向上 时，才建议 **BUY**。
         3. **深度分析**：请详细解释数据之间的冲突（例如：为什么形态好但基本面差要回避？）。
+        4. **IC反馈**：若IC均值<=0或显著性不足，应降低置信度或给出观望/回避。
 
         {format_instructions}
         """
@@ -64,7 +68,7 @@ class QuantAgent:
         self.prompt = PromptTemplate(
             template=template,
             input_variables=["symbol", "date", "total_score", "initial_action", "win_rate", "ma_trend", "rsi", "macd",
-                             "pe_ttm", "pb", "roe", "news_summary"],
+                             "pe_ttm", "pb", "roe", "news_summary", "ic_summary"],
             partial_variables={"format_instructions": self.parser.get_format_instructions()}
         )
 
@@ -112,11 +116,24 @@ class QuantAgent:
             return True
         return self._init_llm()
 
-    def analyze(self, symbol, total_score, initial_action, visual_data, factor_data, fund_data, news_text=""):
+    def analyze(self, symbol, total_score, initial_action, visual_data, factor_data, fund_data, news_text="", ic_summary=None):
         if not self._ensure_llm():
             return self._fallback_result(f"API 连接失败: {self._last_error or '请检查网络或额度'}")
 
         from datetime import datetime
+        if isinstance(ic_summary, dict):
+            ic_text = (
+                f"IC均值: {ic_summary.get('mean_ic', 'N/A')} | "
+                f"IR: {ic_summary.get('ir', 'N/A')} | "
+                f"IC正相关比例: {ic_summary.get('positive_ratio', 'N/A')} | "
+                f"显著性: {ic_summary.get('significant', 'N/A')} | "
+                f"样本: {ic_summary.get('samples', 'N/A')}"
+            )
+        elif isinstance(ic_summary, str) and ic_summary.strip():
+            ic_text = ic_summary
+        else:
+            ic_text = "IC未计算或不可用（未运行因子有效性分析）"
+
         payload = {
             "symbol": symbol,
             "date": datetime.now().strftime("%Y-%m-%d"),
@@ -129,7 +146,8 @@ class QuantAgent:
             "pe_ttm": fund_data.get('pe_ttm', 0),
             "pb": fund_data.get('pb', 0),
             "roe": fund_data.get('roe', 0),
-            "news_summary": str(news_text)[:2000]
+            "news_summary": str(news_text)[:2000],
+            "ic_summary": ic_text
         }
         # 工业级优化：增强重试机制和超时控制
         max_retries = 3
