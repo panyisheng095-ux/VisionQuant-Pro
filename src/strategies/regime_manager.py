@@ -226,9 +226,34 @@ class RegimeManager:
         Returns:
             动态权重结果
         """
-        # 1. 获取regime权重
+        # 1. 获取regime权重（基础）
         current_regime = self.get_current_regime(returns)
-        regime_weights = self.get_regime_weights(current_regime)
+        base_weights = self.get_regime_weights(current_regime)
+
+        # 1.1 趋势/波动动态调整（更统计化的权重修正）
+        trend_60 = None
+        vol_60 = None
+        trend_score = 0.5
+        vol_penalty = 0.0
+        if returns is not None and len(returns) >= 60:
+            try:
+                trend_60 = float(returns.rolling(60).mean().iloc[-1] * 252)
+                vol_60 = float(returns.rolling(60).std().iloc[-1] * np.sqrt(252))
+                trend_score = float(1 / (1 + np.exp(-trend_60 / (vol_60 + 1e-8))))
+                vol_penalty = min(max((vol_60 - 0.25) / 0.25, 0.0), 1.0)
+            except Exception:
+                pass
+
+        v = base_weights.get('kline_factor', 0.5)
+        f = base_weights.get('fundamental', 0.3)
+        q = base_weights.get('technical', 0.2)
+
+        # 趋势越强 -> 视觉/技术权重上调；波动越高 -> 基本面权重上调
+        v_adj = v * (0.8 + 0.4 * trend_score) * (1 - 0.2 * vol_penalty)
+        q_adj = q * (0.8 + 0.3 * trend_score) * (1 - 0.3 * vol_penalty)
+        f_adj = f * (1.2 - 0.3 * trend_score) * (1 + 0.3 * vol_penalty)
+
+        regime_weights = {'kline_factor': v_adj, 'fundamental': f_adj, 'technical': q_adj}
         
         # 2. 如果提供了因子数据，进行失效调整
         if factor_values is not None and returns is not None:
@@ -259,10 +284,25 @@ class RegimeManager:
                 regime_weights['fundamental'] = regime_weights.get('fundamental', 0.3) * scale
                 regime_weights['technical'] = regime_weights.get('technical', 0.2) * scale
         
+        # 归一化
+        total_w = sum(regime_weights.values())
+        if total_w > 0:
+            regime_weights = {k: v / total_w for k, v in regime_weights.items()}
+
         return {
             'weights': regime_weights,
             'regime': current_regime,
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'explain': {
+                'base_weights': base_weights,
+                'trend_60': None if trend_60 is None else round(trend_60, 4),
+                'vol_60': None if vol_60 is None else round(vol_60, 4),
+                'trend_score': round(trend_score, 4),
+                'vol_penalty': round(vol_penalty, 4),
+                'formula': "w_V = base_V*(0.8+0.4*trend_score)*(1-0.2*vol_penalty); "
+                           "w_Q = base_Q*(0.8+0.3*trend_score)*(1-0.3*vol_penalty); "
+                           "w_F = base_F*(1.2-0.3*trend_score)*(1+0.3*vol_penalty)"
+            }
         }
 
 

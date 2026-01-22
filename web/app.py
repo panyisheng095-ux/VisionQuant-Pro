@@ -15,6 +15,12 @@ PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+# 强制禁用代理（避免 AkShare/requests 被系统代理影响）
+for _k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"]:
+    os.environ.pop(_k, None)
+os.environ.setdefault("NO_PROXY", "*")
+os.environ.setdefault("no_proxy", "*")
+
 try:
     from src.data.data_loader import DataLoader
     from src.data.news_harvester import NewsHarvester
@@ -90,14 +96,35 @@ def _render_match_image(symbol: str, date_str: str, loader, out_path: str):
     except Exception:
         return None
 
-def _augment_matches(matches, query_img_path, query_prices, loader, vision_engine, tmp_dir):
+def _augment_matches(matches, query_img_path, query_prices, loader, vision_engine, tmp_dir, filter_trend: bool = True):
     if not matches:
         return matches
+    strict_list = []
+    relaxed_list = []
+    def _seg_signs(prices):
+        if prices is None or len(prices) < 6:
+            return None
+        n = len(prices)
+        seg = n // 3
+        head = prices[seg] - prices[0]
+        mid = prices[2 * seg] - prices[seg]
+        tail = prices[-1] - prices[2 * seg]
+        return [1 if x >= 0 else -1 for x in [head, mid, tail]]
+
+    query_trend = None
+    query_segs = None
+    if query_prices is not None and len(query_prices) >= 6:
+        query_trend = 1 if query_prices[-1] > query_prices[0] else -1
+        query_segs = _seg_signs(query_prices)
     q_pix = vision_engine._load_pixel_vector(query_img_path)
     q_edge = vision_engine._load_edge_vector(query_img_path)
     for i, m in enumerate(matches):
         sym = str(m.get("symbol", "")).zfill(6)
         date_str = m.get("date")
+        trend_penalty = 0.0
+        seg_penalty = 0.0
+        corr_penalty = 0.0
+        strict_ok = False
         # 1) 像素/边缘相似度兜底
         if m.get("pixel_sim") is None or m.get("edge_sim") is None:
             path = vision_engine._resolve_image_path(m.get("path"), sym, date_str)
@@ -125,22 +152,40 @@ def _augment_matches(matches, query_img_path, query_prices, loader, vision_engin
             if m.get("edge_sim") is None:
                 m["edge_sim"] = m.get("pixel_sim")
 
-        # 2) 相关性与回报相关兜底
-        if (m.get("correlation") is None or m.get("ret_corr") is None) and query_prices is not None:
+        # 2) 相关性与回报相关兜底 + 趋势/段落一致性过滤
+        if query_prices is not None:
             try:
                 dfp = loader.get_stock_data(sym)
                 if dfp is not None and not dfp.empty:
                     dfp.index = pd.to_datetime(dfp.index)
                     dt = pd.to_datetime(str(date_str), errors="coerce")
-                    if dt in dfp.index:
-                        loc = dfp.index.get_loc(dt)
-                        if loc >= 19:
+                    if dt not in dfp.index:
+                        candidates = dfp.index[dfp.index <= dt]
+                        if len(candidates) == 0:
+                            continue
+                        dt = candidates.max()
+                    loc = dfp.index.get_loc(dt)
+                    if loc >= 19:
                             match_prices = dfp.iloc[loc - 19: loc + 1]['Close'].values
+                            if filter_trend and query_trend is not None:
+                                match_trend = 1 if match_prices[-1] > match_prices[0] else -1
+                                m["trend_match"] = 1 if match_trend == query_trend else 0
+                                if match_trend != query_trend:
+                                    trend_penalty = -0.08
+                            if filter_trend and query_segs is not None:
+                                match_segs = _seg_signs(match_prices)
+                                if match_segs is not None:
+                                    seg_agree = sum(1 for a, b in zip(query_segs, match_segs) if a == b)
+                                    m["seg_score"] = seg_agree / 3.0
+                                    if seg_agree < 2:
+                                        seg_penalty = -0.06
                             qn = (query_prices - query_prices.mean()) / (query_prices.std() + 1e-8)
                             mn = (match_prices - match_prices.mean()) / (match_prices.std() + 1e-8)
                             corr = np.corrcoef(qn, mn)[0, 1]
                             if not np.isnan(corr):
                                 m["correlation"] = float(corr)
+                                if corr < 0:
+                                    corr_penalty = -0.05
                             q_ret = np.diff(query_prices) / (query_prices[:-1] + 1e-8)
                             m_ret = np.diff(match_prices) / (match_prices[:-1] + 1e-8)
                             q_ret = (q_ret - q_ret.mean()) / (q_ret.std() + 1e-8)
@@ -150,7 +195,32 @@ def _augment_matches(matches, query_img_path, query_prices, loader, vision_engin
                                 m["ret_corr"] = float(corr2)
             except Exception:
                 pass
-    return matches
+        # 形态综合评分（强调头/中/尾 + 相关性/回报相关）
+        corr = m.get("correlation")
+        ret_corr = m.get("ret_corr")
+        if corr is None and ret_corr is not None:
+            corr = ret_corr
+        corr_norm = (float(corr) + 1.0) / 2.0 if corr is not None else 0.5
+        seg_score = m.get("seg_score", 0.5)
+        pix = m.get("pixel_sim", m.get("score", m.get("sim_score", 0.5)))
+        trend_match = m.get("trend_match", 1)
+        shape_score = 0.50 * corr_norm + 0.30 * seg_score + 0.10 * pix + 0.10 * trend_match
+
+        base_score = m.get("score", m.get("sim_score", 0.0))
+        m["score"] = float(shape_score) + trend_penalty + seg_penalty + corr_penalty
+
+        # 严格候选：趋势一致 + 段落一致 + 相关性非负
+        if trend_match == 1 and seg_score >= 0.67 and (corr is None or corr >= 0):
+            strict_ok = True
+
+        if strict_ok:
+            strict_list.append(m)
+        else:
+            relaxed_list.append(m)
+
+    strict_list.sort(key=lambda x: x.get("score", 0), reverse=True)
+    relaxed_list.sort(key=lambda x: x.get("score", 0), reverse=True)
+    return strict_list + relaxed_list
 
 st.set_page_config(page_title="VisionQuant Pro", layout="wide", page_icon="🦄")
 st.markdown("""
@@ -188,6 +258,7 @@ if "portfolio_weights" not in st.session_state: st.session_state.portfolio_weigh
 if "portfolio_metrics" not in st.session_state: st.session_state.portfolio_metrics = {}
 if "current_symbol" not in st.session_state: st.session_state.current_symbol = None
 if "ic_summary" not in st.session_state: st.session_state.ic_summary = {}
+if "ai_reports" not in st.session_state: st.session_state.ai_reports = {}
 
 # URL 跳转预处理：先写入 session_state，让侧边栏控件同步
 url_symbol = st.query_params.get("symbol")
@@ -221,13 +292,13 @@ with st.sidebar:
             if eng["loader"].get_current_data_source() != "akshare":
                 eng["loader"].switch_data_source("akshare")
 
-    st.divider()
+        st.divider()
     symbol_input = st.text_input("请输入 A 股代码", value="601899", help="输入6位代码", key="symbol_input")
     symbol = symbol_input.strip().zfill(6)
     mode = st.radio("功能模块:", ("🔍 单只股票分析", "📊 批量组合分析"), key="mode_select")
 
     if mode == "🔍 单只股票分析":
-        st.divider()
+    st.divider()
         st.caption("回测 / 因子有效性分析入口已统一放在“单只股票分析”报告底部 Tab 中（更符合使用路径）。")
     
     elif mode == "📊 批量组合分析":
@@ -290,7 +361,7 @@ if mode == "🔍 单只股票分析":
         with st.spinner(f"正在全栈扫描 {symbol}..."):
             try:
                 logger.info(f"开始分析股票: {symbol}")
-                df = eng["loader"].get_stock_data(symbol)
+            df = eng["loader"].get_stock_data(symbol)
                 if df.empty: 
                     st.error("数据获取失败")
                     logger.error(f"数据获取失败: {symbol}")
@@ -316,10 +387,10 @@ if mode == "🔍 单只股票分析":
             date_str = df.index[-1].strftime("%Y%m%d")
             q_p = _find_existing_kline_image(symbol, date_str, eng.get("vision"))
             if not q_p:
-                q_p = os.path.join(PROJECT_ROOT, "data", "temp_q.png")
-                mc = mpf.make_marketcolors(up='red', down='green', inherit=True)
-                s = mpf.make_mpf_style(marketcolors=mc, gridstyle='')
-                mpf.plot(df.tail(20), type='candle', style=s, savefig=dict(fname=q_p, dpi=50), figsize=(3, 3), axisoff=True)
+            q_p = os.path.join(PROJECT_ROOT, "data", "temp_q.png")
+            mc = mpf.make_marketcolors(up='red', down='green', inherit=True)
+            s = mpf.make_mpf_style(marketcolors=mc, gridstyle='')
+            mpf.plot(df.tail(20), type='candle', style=s, savefig=dict(fname=q_p, dpi=50), figsize=(3, 3), axisoff=True)
             progress.progress(45)
             
             query_prices = df.tail(20)['Close'].values if len(df) >= 20 else None
@@ -367,7 +438,7 @@ if mode == "🔍 单只股票分析":
             progress.progress(65)
 
             # 补齐相似度字段，减少 N/A
-            matches = _augment_matches(matches, q_p, query_prices, eng["loader"], eng["vision"], os.path.join(PROJECT_ROOT, "data"))
+            matches = _augment_matches(matches, q_p, query_prices, eng["loader"], eng["vision"], os.path.join(PROJECT_ROOT, "data"), filter_trend=True)
             progress.progress(75)
 
             def get_future_trajectories(matches, loader):
@@ -448,12 +519,7 @@ if mode == "🔍 单只股票分析":
             )
 
             ic_summary = (st.session_state.get("ic_summary") or {}).get(symbol)
-            report = eng["agent"].analyze(
-                symbol, total_score, initial_action,
-                {"win_rate": win_rate, "score": 0.9},
-                df_f.iloc[-1].to_dict(), fund_data, news_text,
-                ic_summary=ic_summary
-            )
+            report = None
 
             c_p = os.path.join(PROJECT_ROOT, "data", "comparison.png")
             create_comparison_plot(q_p, matches, c_p)
@@ -500,8 +566,6 @@ if mode == "🔍 单只股票分析":
             PE(TTM): {fund_data.get('pe_ttm')}
             --- 舆情摘要 ---
             {news_text[:500]}
-            --- 初始观点 ---
-            {report.reasoning}
             """
 
             if url_jump_mode:
@@ -665,7 +729,29 @@ if mode == "🔍 单只股票分析":
                     money = ef.get("money_features", {})
                     if money:
                         st.write("量价/资金特征:")
-                        st.json(money)
+                        cn_map = {
+                            "vol_ratio": "量比(成交量/均量)",
+                            "pv_corr": "价量相关性",
+                            "obv_slope": "OBV斜率",
+                            "cmf": "CMF资金流",
+                            "mfi": "MFI资金流指标",
+                            "turnover": "换手率(%)",
+                            "amount": "成交额",
+                            "vwap": "成交均价"
+                        }
+                        rows = []
+                        for k, v in money.items():
+                            label = cn_map.get(k, k)
+                            if v is None:
+                                val = "N/A"
+                            else:
+                                if k in ["turnover"]:
+                                    val = f"{v:.2f}"
+                                else:
+                                    val = f"{v:.4f}" if isinstance(v, (int, float)) else str(v)
+                            rows.append({"指标": label, "数值": val})
+                        if rows:
+                            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
                     dist_map = ef.get("dist_map", {})
                     if dist_map:
                         rows = []
@@ -699,8 +785,9 @@ if mode == "🔍 单只股票分析":
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("AI 总评分", f"{d['score']}/10", delta=d['act'])
             fund_ok = (d.get("fund", {}) or {}).get("_ok", {})
-            m2.metric("ROE", f"{d['fund'].get('roe')}%" if fund_ok.get("finance") else "N/A")
-            m3.metric("PE", f"{d['fund'].get('pe_ttm')}" if fund_ok.get("spot") else "N/A")
+            pe_val = d['fund'].get('pe_ttm', 0)
+            m2.metric("ROE", f"{d['fund'].get('roe')}%" if fund_ok.get("finance") and d['fund'].get('roe', 0) > 0 else "N/A")
+            m3.metric("PE", f"{pe_val:.2f}" if pe_val > 0 else "N/A")
             m4.metric("趋势", "看涨" if d['df_f'].iloc[-1]['MA_Signal'] > 0 else "看跌")
 
             with st.expander("📊 杜邦分析 & 因子明细"):
@@ -708,9 +795,9 @@ if mode == "🔍 单只股票分析":
                 with col_a:
                     st.write("**杜邦拆解**")
                     if fund_ok.get("finance"):
-                        st.write(f"净利率: {d['fund'].get('net_profit_margin')}%")
-                        st.write(f"周转率: {d['fund'].get('asset_turnover')}")
-                        st.write(f"权益乘数: {d['fund'].get('leverage')}x")
+                    st.write(f"净利率: {d['fund'].get('net_profit_margin')}%")
+                    st.write(f"周转率: {d['fund'].get('asset_turnover')}")
+                    st.write(f"权益乘数: {d['fund'].get('leverage')}x")
                 with col_b:
                     st.write("**技术因子**")
                     st.json(d['det'])
@@ -726,6 +813,20 @@ if mode == "🔍 单只股票分析":
                         {"因子": "技术(Q)", "权重": det.get("量化权重", "N/A")},
                     ])
                     st.dataframe(weights_df, use_container_width=True, hide_index=True)
+                    explain = det.get("权重说明") or {}
+                    if explain:
+                        st.caption(f"权重更新时间: {det.get('权重更新时间', 'N/A')}")
+                        st.write("权重计算逻辑（统计/算法）：")
+                        base_w = explain.get("base_weights", {})
+                        base_df = pd.DataFrame([
+                            {"因子": "视觉(V)", "基准权重": base_w.get("kline_factor")},
+                            {"因子": "基本面(F)", "基准权重": base_w.get("fundamental")},
+                            {"因子": "技术(Q)", "基准权重": base_w.get("technical")},
+                        ])
+                        st.dataframe(base_df, use_container_width=True, hide_index=True)
+                        st.write(f"趋势均值(年化): {explain.get('trend_60')} | 波动率(年化): {explain.get('vol_60')}")
+                        st.write(f"趋势得分: {explain.get('trend_score')} | 波动惩罚: {explain.get('vol_penalty')}")
+                        st.caption(f"公式: {explain.get('formula')}")
             try:
                 v = float(det.get("视觉分(V)", 0))
                 f = float(det.get("财务分(F)", 0))
@@ -744,7 +845,13 @@ if mode == "🔍 单只股票分析":
 
         with c_right:
             st.subheader(f"3. 行业对标 ({d['ind']})")
+            if d['peers'] is not None and not d['peers'].empty:
             st.dataframe(d['peers'], hide_index=True)
+            else:
+                st.warning(f"⚠️ 行业对标数据暂不可用（行业: {d['ind']}）")
+                if d.get("fund", {}).get("_err"):
+                    with st.expander("🔍 诊断信息", expanded=False):
+                        st.json(d["fund"].get("_err", []))
 
         st.divider()
         st.subheader("4. 新闻舆情")
@@ -847,23 +954,44 @@ if mode == "🔍 单只股票分析":
 
         st.divider()
         st.subheader("5. AI 基金经理终审")
-        color = "green" if d['rep'].action == "BUY" else "red" if d['rep'].action == "SELL" else "orange"
+        report = st.session_state.ai_reports.get(symbol)
+        ic_summary = (st.session_state.get("ic_summary") or {}).get(symbol)
+        if report is None:
+            if ic_summary is None:
+                st.info("尚未检测到 IC 摘要，建议先运行「因子有效性分析」，再生成 AI 终审。")
+            if st.button("生成 AI 终审", key="ai_final_btn"):
+                with st.spinner("AI 终审生成中..."):
+                    report = eng["agent"].analyze(
+                        symbol, d["score"], d["act"],
+                        {"win_rate": d.get("win", 50), "score": 0.9},
+                        d["df_f"].iloc[-1].to_dict(), d["fund"], d["news"],
+                        ic_summary=ic_summary
+                    )
+                    st.session_state.ai_reports[symbol] = report
+        if report is None:
+            st.warning("AI 终审尚未生成。")
+        else:
+            action_cn_map = {"BUY": "买入", "SELL": "卖出", "WAIT": "观望"}
+            action_cn = action_cn_map.get(report.action, report.action)
+            color = "green" if report.action == "BUY" else "red" if report.action == "SELL" else "orange"
         st.markdown(f"""
         <div class="agent-box">
-            <h2 style="color:{color}; margin:0">{d['rep'].action}</h2>
-            <p>信心: {d['rep'].confidence}% | 风险: {d['rep'].risk_level}</p>
-            <hr><p>{d['rep'].reasoning}</p>
+                <h2 style="color:{color}; margin:0">{action_cn}</h2>
+                <p>信心: {report.confidence}% | 风险: {report.risk_level}</p>
+                <hr><p>{report.reasoning}</p>
         </div>
         """, unsafe_allow_html=True)
 
         pdf_p = os.path.join(PROJECT_ROOT, "data", f"Report_{symbol}.pdf")
-        if st.button("📄 导出 PDF"):
-            generate_report_pdf(f"{d['name']}({symbol})", d['rep'], d['c_p'], pdf_p)
+        if report and st.button("📄 导出 PDF"):
+            generate_report_pdf(f"{d['name']}({symbol})", report, d['c_p'], pdf_p)
             with open(pdf_p, "rb") as f:
                 st.download_button("下载 PDF", f, file_name=f"VQ_{symbol}.pdf")
 
         st.divider()
         st.subheader("💬 智能对话")
+        if "chat_history" not in st.session_state:
+            st.session_state.chat_history = []
         for msg in st.session_state.chat_history:
             with st.chat_message(msg["role"]): 
                 st.markdown(msg["content"])
@@ -876,7 +1004,7 @@ if mode == "🔍 单只股票分析":
         if audio:
             transcribed = eng["audio"].transcribe(audio['bytes'])
             if transcribed and transcribed != st.session_state.last_voice_text:
-                user_voice_text = transcribed
+                    user_voice_text = transcribed
                 st.session_state.last_voice_text = transcribed
         with c_input:
             text_input = st.chat_input("输入问题...")
@@ -1101,7 +1229,7 @@ elif mode == "📊 批量组合分析":
                     strat_df = run_stratified_backtest_batch(list(batch_results.keys()), eng)
                     if strat_df is not None and not strat_df.empty:
                         st.dataframe(strat_df, use_container_width=True, hide_index=True)
-                    else:
+                        else:
                         st.info("分层样本不足或数据不可用")
 
             # 权重动态变化（简化：基于20日动量的月度再平衡）
@@ -1176,5 +1304,5 @@ elif mode == "📊 批量组合分析":
                         st.write(f"{data.get('action', 'WAIT')} - {data.get('reasoning', '')[:50]}")
                     st.divider()
     
-    else:
+                else:
         st.info("👈 请在左侧输入股票代码并点击启动")

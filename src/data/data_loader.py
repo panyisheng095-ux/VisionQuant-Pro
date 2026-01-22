@@ -137,6 +137,67 @@ class DataLoader:
         symbol = str(symbol).strip().zfill(6)
         file_path = os.path.join(self.data_dir, f"{symbol}.csv")
 
+        def _validate_df(df_new):
+            if df_new is None or df_new.empty:
+                return None
+            if self.enable_quality_check:
+                quality_result = self.quality_checker.check_data_quality(df_new, symbol)
+                if not quality_result['is_valid']:
+                    print(f"⚠️ [{symbol}] 数据质量检查未通过 (得分: {quality_result['score']}/100)")
+                    if quality_result['score'] < 50:
+                        print(f"  错误: {quality_result['errors']}")
+                        return None
+            return df_new
+
+        def _fetch_with_fallback(start_dt, end_dt):
+            if start_dt > end_dt:
+                return pd.DataFrame()
+            start_str = start_dt.strftime("%Y%m%d")
+            end_str = end_dt.strftime("%Y%m%d")
+            df_new = None
+            # 当前数据源
+            if self.data_source and self.data_source.is_available():
+                print(f"⬇️ [{self.data_source_name}] 拉取 {symbol} 行情 {start_str}-{end_str}...")
+                df_new = self.data_source.get_stock_data(
+                    symbol=symbol,
+                    start_date=start_str,
+                    end_date=end_str,
+                    adjust=adjust
+                )
+                df_new = _validate_df(df_new)
+            if (df_new is None or df_new.empty) and self.data_source_name != 'akshare':
+                print(f"🔄 回退到akshare数据源...")
+                fallback_source = AkshareDataSource()
+                if fallback_source.is_available():
+                    df_new = fallback_source.get_stock_data(
+                        symbol=symbol,
+                        start_date=start_str,
+                        end_date=end_str,
+                        adjust=adjust
+                    )
+                    df_new = _validate_df(df_new)
+            return df_new if df_new is not None else pd.DataFrame()
+
+        def _detect_gaps(idx, gap_days: int = 45, max_gaps: int = 10):
+            if idx is None or len(idx) < 2:
+                return []
+            idx = pd.to_datetime(idx)
+            idx = idx.sort_values()
+            gaps = []
+            diffs = idx.to_series().diff().dt.days
+            for i, gap in enumerate(diffs):
+                if pd.isna(gap):
+                    continue
+                if gap > gap_days:
+                    prev_dt = idx[i - 1]
+                    next_dt = idx[i]
+                    gap_start = prev_dt + timedelta(days=1)
+                    gap_end = next_dt - timedelta(days=1)
+                    gaps.append((gap_start, gap_end))
+                    if len(gaps) >= max_gaps:
+                        break
+            return gaps
+
         # 内存缓存命中（优先）
         cache_key = (symbol, start_date, end_date, adjust)
         if use_cache and self._mem_cache_enabled:
@@ -152,6 +213,7 @@ class DataLoader:
             try:
                 df_cache_all = pd.read_csv(file_path, index_col=0, parse_dates=True)
                 df_cache_all = self._normalize_columns(df_cache_all)
+                df_cache_all = self._ensure_datetime_index(df_cache_all)
                 if not df_cache_all.empty:
                     df_cache_all.sort_index(inplace=True)
                     first_date_in_file = pd.to_datetime(df_cache_all.index.min()).normalize()
@@ -160,6 +222,22 @@ class DataLoader:
                     need_later = req_end_dt > last_date_in_file
                     need_download = need_earlier or need_later
                     if not need_download:
+                        # 检测并修复内部大段缺口（避免中途年份空窗）
+                        gaps = _detect_gaps(df_cache_all.index)
+                        if gaps:
+                            for g_start, g_end in gaps:
+                                if g_end < req_start_dt or g_start > req_end_dt:
+                                    continue
+                                patch = _fetch_with_fallback(g_start, g_end)
+                                if patch is not None and not patch.empty:
+                                    patch = self._normalize_columns(patch)
+                                    patch = self._ensure_datetime_index(patch)
+                                    df_cache_all = pd.concat([df_cache_all, patch], axis=0)
+                            df_cache_all = self._ensure_datetime_index(df_cache_all)
+                            df_cache_all.sort_index(inplace=True)
+                            df_cache_all = df_cache_all[~df_cache_all.index.duplicated(keep='last')]
+                            if use_cache:
+                                df_cache_all.to_csv(file_path)
                         df_out = df_cache_all.loc[req_start_dt:req_end_dt]
                         if use_cache and self._mem_cache_enabled:
                             self._mem_cache[cache_key] = df_out
@@ -176,47 +254,6 @@ class DataLoader:
 
         # === 2. 从数据源下载（如果需要） ===
         if need_download:
-            def _validate_df(df_new):
-                if df_new is None or df_new.empty:
-                    return None
-                if self.enable_quality_check:
-                    quality_result = self.quality_checker.check_data_quality(df_new, symbol)
-                    if not quality_result['is_valid']:
-                        print(f"⚠️ [{symbol}] 数据质量检查未通过 (得分: {quality_result['score']}/100)")
-                        if quality_result['score'] < 50:
-                            print(f"  错误: {quality_result['errors']}")
-                            return None
-                return df_new
-
-            def _fetch_with_fallback(start_dt, end_dt):
-                if start_dt > end_dt:
-                    return pd.DataFrame()
-                start_str = start_dt.strftime("%Y%m%d")
-                end_str = end_dt.strftime("%Y%m%d")
-                df_new = None
-                # 当前数据源
-                if self.data_source and self.data_source.is_available():
-                    print(f"⬇️ [{self.data_source_name}] 拉取 {symbol} 行情 {start_str}-{end_str}...")
-                    df_new = self.data_source.get_stock_data(
-                        symbol=symbol,
-                        start_date=start_str,
-                        end_date=end_str,
-                        adjust=adjust
-                    )
-                    df_new = _validate_df(df_new)
-                if (df_new is None or df_new.empty) and self.data_source_name != 'akshare':
-                    print(f"🔄 回退到akshare数据源...")
-                    fallback_source = AkshareDataSource()
-                    if fallback_source.is_available():
-                        df_new = fallback_source.get_stock_data(
-                            symbol=symbol,
-                            start_date=start_str,
-                            end_date=end_str,
-                            adjust=adjust
-                        )
-                        df_new = _validate_df(df_new)
-                return df_new if df_new is not None else pd.DataFrame()
-
             if not df_cache_all.empty:
                 df_cache_all.sort_index(inplace=True)
                 first_date_in_file = pd.to_datetime(df_cache_all.index.min()).normalize()
@@ -236,8 +273,34 @@ class DataLoader:
                         df_cache_all = pd.concat([df_cache_all, new_parts_df], axis=0)
 
                 if not df_cache_all.empty:
+                    df_cache_all = self._ensure_datetime_index(df_cache_all)
                     df_cache_all.sort_index(inplace=True)
                     df_cache_all = df_cache_all[~df_cache_all.index.duplicated(keep='last')]
+
+                    # 补齐中间缺口
+                    gaps = _detect_gaps(df_cache_all.index)
+                    if gaps:
+                        for g_start, g_end in gaps:
+                            if g_end < req_start_dt or g_start > req_end_dt:
+                                continue
+                            patch = _fetch_with_fallback(g_start, g_end)
+                            if patch is not None and not patch.empty:
+                                patch = self._normalize_columns(patch)
+                                patch = self._ensure_datetime_index(patch)
+                                df_cache_all = pd.concat([df_cache_all, patch], axis=0)
+                        df_cache_all = self._ensure_datetime_index(df_cache_all)
+                        df_cache_all.sort_index(inplace=True)
+                        df_cache_all = df_cache_all[~df_cache_all.index.duplicated(keep='last')]
+
+                    # 如果仍存在超大缺口，尝试全量刷新请求范围
+                    gaps_after = _detect_gaps(df_cache_all.index, gap_days=120, max_gaps=1)
+                    if gaps_after:
+                        full_df = _fetch_with_fallback(req_start_dt, req_end_dt)
+                        if full_df is not None and not full_df.empty:
+                            full_df = self._normalize_columns(full_df)
+                            full_df = self._ensure_datetime_index(full_df)
+                            df_cache_all = full_df.copy()
+
                     if use_cache:
                         df_cache_all.to_csv(file_path)
                     df_out = df_cache_all.loc[req_start_dt:req_end_dt]
@@ -256,6 +319,21 @@ class DataLoader:
             df_new = _fetch_with_fallback(req_start_dt, req_end_dt)
             if df_new is not None and not df_new.empty:
                 df_new = self._normalize_columns(df_new)
+                df_new = self._ensure_datetime_index(df_new)
+                # 补齐中间缺口
+                gaps = _detect_gaps(df_new.index)
+                if gaps:
+                    for g_start, g_end in gaps:
+                        if g_end < req_start_dt or g_start > req_end_dt:
+                            continue
+                        patch = _fetch_with_fallback(g_start, g_end)
+                        if patch is not None and not patch.empty:
+                            patch = self._normalize_columns(patch)
+                            patch = self._ensure_datetime_index(patch)
+                            df_new = pd.concat([df_new, patch], axis=0)
+                    df_new = self._ensure_datetime_index(df_new)
+                    df_new.sort_index(inplace=True)
+                    df_new = df_new[~df_new.index.duplicated(keep='last')]
                 if use_cache:
                     df_new.to_csv(file_path)
                 df_out = df_new.loc[req_start_dt:req_end_dt]
@@ -267,7 +345,27 @@ class DataLoader:
 
             return pd.DataFrame()
 
-        return df_cache_all.loc[req_start_dt:req_end_dt].copy() if not df_cache_all.empty else pd.DataFrame()
+        try:
+            if not df_cache_all.empty:
+                df_cache_all = self._ensure_datetime_index(df_cache_all)
+                return df_cache_all.loc[req_start_dt:req_end_dt].copy()
+        except Exception as e:
+            logger.warning("时间索引切片失败 %s: %s", symbol, e)
+        return pd.DataFrame()
+
+    def _ensure_datetime_index(self, df: pd.DataFrame) -> pd.DataFrame:
+        """确保索引为DatetimeIndex，避免Timestamp切片异常"""
+        if df is None or df.empty:
+            return df
+        data = df.copy()
+        try:
+            if not isinstance(data.index, pd.DatetimeIndex):
+                data.index = pd.to_datetime(data.index, errors="coerce")
+            data = data[~data.index.isna()]
+            data.sort_index(inplace=True)
+        except Exception:
+            return df
+        return data
 
     def _normalize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """

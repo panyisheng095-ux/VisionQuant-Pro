@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod
 import pandas as pd
 from typing import Optional, List, Dict
 from datetime import datetime
+from src.utils.net_utils import no_proxy_env
 
 
 class DataSource(ABC):
@@ -162,13 +163,14 @@ class AkshareDataSource(DataSource):
             if end_date is None:
                 end_date = datetime.now().strftime("%Y%m%d")
             
-            df = self.ak.stock_zh_a_hist(
-                symbol=symbol,
-                period="daily",
-                start_date=start_date,
-                end_date=end_date,
-                adjust=adjust
-            )
+            with no_proxy_env():
+                df = self.ak.stock_zh_a_hist(
+                    symbol=symbol,
+                    period="daily",
+                    start_date=start_date,
+                    end_date=end_date,
+                    adjust=adjust
+                )
             
             return self._format_data(df)
         except Exception as e:
@@ -191,12 +193,13 @@ class AkshareDataSource(DataSource):
             if end_date is None:
                 end_date = datetime.now().strftime("%Y%m%d")
             
-            df = self.ak.index_zh_a_hist(
-                symbol=index_code,
-                period="daily",
-                start_date=start_date,
-                end_date=end_date
-            )
+            with no_proxy_env():
+                df = self.ak.index_zh_a_hist(
+                    symbol=index_code,
+                    period="daily",
+                    start_date=start_date,
+                    end_date=end_date
+                )
             
             return self._format_data(df)
         except Exception as e:
@@ -209,7 +212,8 @@ class AkshareDataSource(DataSource):
             return pd.DataFrame()
         
         try:
-            df = self.ak.stock_info_a_code_name()
+            with no_proxy_env():
+                df = self.ak.stock_info_a_code_name()
             return df
         except Exception as e:
             print(f"❌ AkShare获取股票列表失败: {e}")

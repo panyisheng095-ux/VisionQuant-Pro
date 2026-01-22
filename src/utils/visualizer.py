@@ -94,10 +94,16 @@ def create_comparison_plot(query_img_path, search_results, output_path):
                     # 标题显示相似度和代码
                     score_val = res.get('score', 0)
                     corr_val = res.get('correlation')
+                    seg_val = res.get('seg_score')
+                    trend_val = res.get('trend_match')
                     if corr_val is not None:
                         title = f"Top {i + 1}\n{symbol}\n{date_str}\nSim:{score_val:.2f} Corr:{corr_val:.2f}"
                     else:
                         title = f"Top {i + 1}\n{symbol}\n{date_str}\nSim: {score_val:.3f}"
+                    if seg_val is not None:
+                        title += f"\nSeg:{float(seg_val):.2f}"
+                    if trend_val is not None:
+                        title += f" Trend:{'同' if int(trend_val)==1 else '反'}"
                     ax.set_title(title, fontsize=9)
                 except Exception as e:
                     ax.text(0.5, 0.5, f"Top {i+1}\nLoad Error", ha='center', va='center', fontsize=10, color='red')

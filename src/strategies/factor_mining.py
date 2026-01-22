@@ -140,7 +140,9 @@ class FactorMiner:
                     '视觉权重': round(v_weight, 3),
                     '财务权重': round(f_weight, 3),
                     '量化权重': round(q_weight, 3),
-                    'regime': dynamic_weights.get('regime', 'unknown')
+                    'regime': dynamic_weights.get('regime', 'unknown'),
+                    '权重说明': dynamic_weights.get('explain', {}),
+                    '权重更新时间': dynamic_weights.get('timestamp')
                 }
             except Exception as e:
                 print(f"⚠️ 动态权重计算失败: {e}，使用固定权重")

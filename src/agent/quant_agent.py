@@ -39,6 +39,7 @@ class QuantAgent:
         # 提前准备 Prompt（便于后续动态重连）
         template = """
         你是一位华尔街顶级对冲基金首席风险官 (CRO)。请根据以下多模态数据撰写深度投资备忘录。
+        **输出必须为中文**，但 action 字段仍使用 BUY/SELL/WAIT。
 
         【数据快照】
         股票: {symbol} | 日期: {date}
@@ -78,9 +79,10 @@ class QuantAgent:
 
         # === 核心修正：优先使用你账号支持的高级模型 ===
         # 根据你之前的 check-api 结果，优先调用 2.5 和 2.0 系列
+        # 速度优先：先用 flash，再回退到 pro
         self._candidate_models = [
-            "gemini-2.5-pro",  # 首选：最强逻辑
-            "gemini-2.0-flash-exp",  # 次选：速度最快
+            "gemini-2.0-flash-exp",  # 首选：速度最快
+            "gemini-2.5-pro",  # 次选：强逻辑
             "gemini-1.5-pro",  # 备选
             "gemini-pro"  # 兜底
         ]
@@ -146,12 +148,12 @@ class QuantAgent:
             "pe_ttm": fund_data.get('pe_ttm', 0),
             "pb": fund_data.get('pb', 0),
             "roe": fund_data.get('roe', 0),
-            "news_summary": str(news_text)[:2000],
+            "news_summary": str(news_text)[:800],
             "ic_summary": ic_text
         }
         # 工业级优化：增强重试机制和超时控制
-        max_retries = 3
-        base_delay = 1.0
+        max_retries = 2
+        base_delay = 0.6
         
         for attempt in range(max_retries):
             try:
@@ -194,7 +196,7 @@ class QuantAgent:
             return "AI 未连接（请检查 GOOGLE_API_KEY / 网络）"
         try:
             messages = [
-                SystemMessage(content=f"你是一个专业的基金经理。背景数据：\n{context_str}"),
+                SystemMessage(content=f"你是一个专业的基金经理，请使用中文回答。背景数据：\n{context_str}"),
                 HumanMessage(content=user_question)
             ]
             response = self.llm.invoke(messages)

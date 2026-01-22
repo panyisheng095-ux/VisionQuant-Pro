@@ -451,6 +451,13 @@ class VisionEngine:
         ISOLATION_DAYS = 20
         max_dt = self._parse_date(max_date) if max_date else None
 
+        # 预先提取 Query 的形态特征与趋势
+        query_feat = None
+        query_trend = None
+        if query_prices is not None and len(query_prices) >= 6:
+            query_feat = _extract_kline_features(query_prices)
+            query_trend = 1 if query_prices[-1] > query_prices[0] else -1
+
         # === 优化2: 视觉候选 +（可选）价格相关性 ===
         # 注意：对“非热门股/冷门日期”，在循环里频繁拉取历史数据很容易失败。
         # 我们将相关性视为“可选增强”：算得出来就提升排序，算不出来就回退到纯视觉TopK，
@@ -502,6 +509,8 @@ class VisionEngine:
             dtw_sim = None
             feature_sim = None
             match_trend = None
+            seg_score = None
+            trend_match = None
             
             if loader is not None and (max_price_checks is None or price_checks < max_price_checks):
                 try:
@@ -551,6 +560,17 @@ class VisionEngine:
                                 feat_cos = np.dot(q_feat, m_feat) / (np.linalg.norm(q_feat) * np.linalg.norm(m_feat) + 1e-8)
                                 feature_sim = (feat_cos + 1.0) / 2.0
                                 
+                                # 段落一致性（首/中/尾）
+                                seg_agree = 0
+                                for qi, mi in zip(q_feat[5:], m_feat[5:]):
+                                    if (qi >= 0 and mi >= 0) or (qi < 0 and mi < 0):
+                                        seg_agree += 1
+                                seg_score = seg_agree / 3.0
+                                
+                                # 趋势方向是否一致（用于评分惩罚，不做硬过滤）
+                                if query_trend is not None and match_trend is not None:
+                                    trend_match = 1 if match_trend == query_trend else 0
+                                
                 except Exception:
                     correlation = None
 
@@ -586,6 +606,8 @@ class VisionEngine:
                 "dtw_sim": (None if dtw_sim is None else float(dtw_sim)),
                 "feature_sim": (None if feature_sim is None else float(feature_sim)),
                 "match_trend": match_trend,
+                "seg_score": (None if seg_score is None else float(seg_score)),
+                "trend_match": trend_match,
                 "sim_score": float(sim_score),
                 "corr_norm": (None if corr_norm is None else float(corr_norm)),
                 "path": info.get("path")
@@ -598,42 +620,57 @@ class VisionEngine:
             if len(high_quality) >= top_k * 3:
                 break
 
-        # === 【核心改进】DTW主导的最终排序 ===
+        # === 最终排序（趋势/段落/相关性为软约束，避免 Top10 缺失）===
         if query_prices is not None and len(query_prices) >= 2:
-            # Step 1: 趋势方向硬约束（必须同涨同跌）
             query_trend = 1 if query_prices[-1] > query_prices[0] else -1
-            
-            # 只保留趋势方向一致的候选
-            trend_matched = [
-                c for c in candidates 
-                if c.get("match_trend") is None or c.get("match_trend") == query_trend
-            ]
-            
-            # Step 2: 优先选择有DTW分数的候选
-            dtw_candidates = [c for c in trend_matched if c.get("dtw_sim") is not None]
-            no_dtw_candidates = [c for c in trend_matched if c.get("dtw_sim") is None]
-            
-            # Step 3: DTW候选按DTW相似度排序（这是关键！）
-            dtw_candidates.sort(key=lambda x: x.get("dtw_sim", 0), reverse=True)
-            
-            # Step 4: 无DTW候选按相关性排序
-            no_dtw_candidates.sort(key=lambda x: x.get("correlation", 0) or 0, reverse=True)
-            
-            # Step 5: 合并（DTW优先）
-            candidates = dtw_candidates + no_dtw_candidates
-            
-            # Step 6: 最终评分（用于显示，但排序已经按DTW完成）
+
             for c in candidates:
-                dtw = c.get("dtw_sim", 0)
-                corr = c.get("correlation", 0) or 0
-                corr_norm = (corr + 1.0) / 2.0
+                dtw = c.get("dtw_sim", None)
+                corr = c.get("correlation", None)
+                corr_norm = (float(corr) + 1.0) / 2.0 if corr is not None else 0.5
                 feat = c.get("feature_sim", 0.5)
-                # 最终分数（仅供显示）
-                c["score"] = 0.60 * dtw + 0.25 * corr_norm + 0.15 * feat if dtw > 0 else corr_norm * 0.5
-        
+                seg = c.get("seg_score", 0.5)
+                sim = c.get("sim_score", 0.5)
+
+                # 趋势/相关性软惩罚：不再硬过滤，避免 Top10 缺失
+                trend_flag = c.get("trend_match")
+                trend_bonus = 0.08 if trend_flag == 1 else (-0.08 if trend_flag == 0 else 0.0)
+                corr_penalty = -0.05 if corr is not None and corr < 0 else 0.0
+
+                if dtw is not None:
+                    base = 0.45 * dtw + 0.25 * corr_norm + 0.15 * feat + 0.10 * seg + 0.05 * sim
+                else:
+                    base = 0.50 * sim + 0.25 * corr_norm + 0.15 * seg + 0.10 * feat
+
+                c["score"] = float(base + trend_bonus + corr_penalty)
+
+            candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
         else:
             # 无价格序列时，回退到纯视觉排序
             candidates.sort(key=lambda x: x.get("sim_score", 0), reverse=True)
+
+        # 如果候选不足，放宽约束补齐（极少数情况）
+        if len(candidates) < top_k:
+            seen = {(c.get("symbol"), c.get("date")) for c in candidates}
+            for vector_score, idx in zip(D[0], I[0]):
+                if len(candidates) >= top_k:
+                    break
+                if idx >= len(self.meta_data):
+                    continue
+                info = self.meta_data[idx]
+                sym = str(info.get("symbol", "")).zfill(6)
+                date_str = str(info.get("date", ""))
+                key = (sym, date_str)
+                if key in seen:
+                    continue
+                candidates.append({
+                    "symbol": sym,
+                    "date": date_str,
+                    "score": float(self._vector_score_to_similarity(vector_score)),
+                    "vector_score": float(vector_score),
+                    "path": info.get("path")
+                })
+                seen.add(key)
 
         # 返回Top-K
         return candidates[:top_k]
@@ -663,7 +700,8 @@ class VisionEngine:
             return None
 
     def search_multi_scale_patterns(self, img_paths: dict, top_k=10, weights=None, query_prices=None,
-                                    rerank_with_pixels=True, rerank_top_k=80, max_date: str = None):
+                                    rerank_with_pixels=True, rerank_top_k=80, max_date: str = None,
+                                    max_price_checks: int = 200):
         """
         多尺度检索：日/周/月图像分别检索，再加权融合
         """
@@ -738,6 +776,75 @@ class VisionEngine:
                     c["pixel_sim"] = visual_sim
                     c["edge_sim"] = edge_norm
                     c["score"] = 0.7 * c["score"] + 0.3 * visual_sim
+
+        # 使用价格特征进行二次重排（强调头/中/尾 & 趋势）
+        if query_prices is not None and len(query_prices) >= 6 and candidates:
+            loader = None
+            try:
+                if self._data_loader is None:
+                    from src.data.data_loader import DataLoader
+                    self._data_loader = DataLoader()
+                loader = self._data_loader
+            except Exception:
+                loader = None
+
+            q_feat = _extract_kline_features(query_prices)
+            q_trend = 1 if query_prices[-1] > query_prices[0] else -1
+            price_df_cache = {}
+
+            for c in candidates[:min(len(candidates), max_price_checks)]:
+                if loader is None:
+                    break
+                sym = str(c.get("symbol", "")).zfill(6)
+                dt = self._parse_date(c.get("date"))
+                if dt is None:
+                    continue
+                try:
+                    if sym not in price_df_cache:
+                        dfp = loader.get_stock_data(sym)
+                        if dfp is None or dfp.empty:
+                            price_df_cache[sym] = None
+                        else:
+                            dfp.index = pd.to_datetime(dfp.index)
+                            price_df_cache[sym] = dfp
+                    dfp = price_df_cache.get(sym)
+                    if dfp is None or dfp.empty:
+                        continue
+                    if dt not in dfp.index:
+                        candidates_dt = dfp.index[dfp.index <= dt]
+                        if len(candidates_dt) == 0:
+                            continue
+                        dt = candidates_dt.max()
+                    loc = dfp.index.get_loc(dt)
+                    if loc < 19:
+                        continue
+                    match_prices = dfp.iloc[loc - 19: loc + 1]["Close"].values
+
+                    # 相关性 + 分段一致性
+                    qn = (query_prices - query_prices.mean()) / (query_prices.std() + 1e-8)
+                    mn = (match_prices - match_prices.mean()) / (match_prices.std() + 1e-8)
+                    corr = np.corrcoef(qn, mn)[0, 1]
+                    corr_norm = (float(corr) + 1.0) / 2.0 if not np.isnan(corr) else 0.5
+
+                    m_feat = _extract_kline_features(match_prices)
+                    seg_score = 0.5
+                    trend_match = 1
+                    if q_feat is not None and m_feat is not None:
+                        seg_agree = 0
+                        for qi, mi in zip(q_feat[5:], m_feat[5:]):
+                            if (qi >= 0 and mi >= 0) or (qi < 0 and mi < 0):
+                                seg_agree += 1
+                        seg_score = seg_agree / 3.0
+                        trend_match = 1 if m_feat[0] == q_trend else 0
+
+                    base = c.get("score", 0.0)
+                    shape_score = 0.50 * corr_norm + 0.30 * seg_score + 0.20 * trend_match
+                    c["correlation"] = float(corr) if not np.isnan(corr) else c.get("correlation")
+                    c["seg_score"] = float(seg_score)
+                    c["trend_match"] = trend_match
+                    c["score"] = 0.60 * base + 0.40 * shape_score
+                except Exception:
+                    continue
         candidates.sort(key=lambda x: x["score"], reverse=True)
 
         # 时间隔离（避免同一股票相邻日期）
@@ -761,8 +868,19 @@ class VisionEngine:
             seen_dates.setdefault(sym, []).append(dt)
             if len(isolated) >= top_k:
                 break
+        # 若隔离后不足，使用原候选补齐
+        if len(isolated) < top_k:
+            seen = {(x.get("symbol"), x.get("date")) for x in isolated}
+            for c in candidates:
+                if len(isolated) >= top_k:
+                    break
+                key = (c.get("symbol"), c.get("date"))
+                if key in seen:
+                    continue
+                isolated.append(c)
+                seen.add(key)
 
-        return isolated if isolated else candidates[:top_k]
+        return isolated[:top_k] if isolated else candidates[:top_k]
 
 
 if __name__ == "__main__":
