@@ -62,6 +62,37 @@ class RegimeManager:
         # 当前regime缓存
         self._current_regime = None
         self._current_regime_date = None
+
+    @staticmethod
+    def _to_float(val, default: float = 0.0) -> float:
+        try:
+            if val is None:
+                return float(default)
+            if isinstance(val, str):
+                val = val.strip()
+                if val == "":
+                    return float(default)
+            return float(val)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _normalize_returns(returns):
+        if returns is None:
+            return None
+        try:
+            if isinstance(returns, pd.DataFrame):
+                if returns.shape[1] == 0:
+                    return None
+                returns = returns.iloc[:, 0]
+            elif isinstance(returns, (list, tuple, np.ndarray)):
+                returns = pd.Series(returns)
+            series = pd.to_numeric(returns, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+            if series.empty:
+                return None
+            return series.astype(float)
+        except Exception:
+            return None
     
     def _load_config(self) -> Dict:
         """加载权重配置"""
@@ -119,6 +150,7 @@ class RegimeManager:
             except Exception as e:
                 print(f"⚠️ 获取市场数据失败: {e}")
         
+        returns = self._normalize_returns(returns)
         if returns is None or len(returns) < 60:
             self._current_regime = 'unknown'
             self._current_regime_date = today
@@ -159,9 +191,14 @@ class RegimeManager:
         if current_regime is None:
             current_regime = self.get_current_regime()
         
-        # 获取基础权重
+        # 获取基础权重（只保留有效因子字段）
         regime_weights = self.config.get('regime_weights', {})
-        base_weights = regime_weights.get(current_regime, self.config.get('default', {}))
+        raw_base = regime_weights.get(current_regime, self.config.get('default', {})) or {}
+        allowed = {"kline_factor", "fundamental", "technical"}
+        base_weights = {k: self._to_float(v, 0.0) for k, v in raw_base.items() if k in allowed}
+        if not base_weights:
+            fallback = self.config.get('default', {}) or {}
+            base_weights = {k: self._to_float(v, 0.0) for k, v in fallback.items() if k in allowed}
         
         # 如果提供了IC值，进行IC调整
         if factor_ics and self.config.get('ic_adjustment', {}).get('enabled', True):
@@ -198,7 +235,8 @@ class RegimeManager:
         adjusted_weights = {}
         
         for factor, base_weight in base_weights.items():
-            ic = factor_ics.get(factor, 0.0)
+            base_weight = self._to_float(base_weight, 0.0)
+            ic = self._to_float(factor_ics.get(factor, 0.0), 0.0)
             
             # IC调整：IC越高，权重越高
             adjustment = ic * adjustment_factor * 100  # 转换为百分比
@@ -227,31 +265,54 @@ class RegimeManager:
             动态权重结果
         """
         # 1. 获取regime权重（基础）
+        returns = self._normalize_returns(returns)
         current_regime = self.get_current_regime(returns)
         base_weights = self.get_regime_weights(current_regime)
 
-        # 1.1 趋势/波动动态调整（更统计化的权重修正）
+        # 1.1 趋势/波动/回撤/尾部风险多因子动态调整（更统计化）
         trend_60 = None
         vol_60 = None
+        drawdown_120 = None
+        skew_60 = None
+        kurt_60 = None
         trend_score = 0.5
-        vol_penalty = 0.0
-        if returns is not None and len(returns) >= 60:
+        vol_score = 0.0
+        dd_score = 0.0
+        tail_score = 0.0
+        skew_penalty = 0.0
+        r = returns if returns is not None else None
+        if r is not None and len(r) >= 20:
             try:
-                trend_60 = float(returns.rolling(60).mean().iloc[-1] * 252)
-                vol_60 = float(returns.rolling(60).std().iloc[-1] * np.sqrt(252))
-                trend_score = float(1 / (1 + np.exp(-trend_60 / (vol_60 + 1e-8))))
-                vol_penalty = min(max((vol_60 - 0.25) / 0.25, 0.0), 1.0)
+                if len(r) >= 60:
+                    trend_60 = float(r.rolling(60).mean().iloc[-1] * 252)
+                    vol_60 = float(r.rolling(60).std().iloc[-1] * np.sqrt(252))
+                    trend_score = float(1 / (1 + np.exp(-(trend_60 / (vol_60 + 1e-8)))))
+                    vol_score = min(max((vol_60 - 0.20) / 0.20, 0.0), 1.0)
+                    skew_60 = float(r.iloc[-60:].skew())
+                    kurt_60 = float(r.iloc[-60:].kurt())
+                    skew_penalty = max(0.0, -skew_60)
+                    tail_score = min(max((kurt_60 + 1.0) / 6.0, 0.0), 1.0)
+                if len(r) >= 120:
+                    window = r.iloc[-120:]
+                    cum = (1 + window).cumprod()
+                    peak = cum.cummax()
+                    drawdown_120 = float((cum / peak - 1.0).min())
+                    dd_score = min(max(-drawdown_120 / 0.25, 0.0), 1.0)
             except Exception:
                 pass
 
-        v = base_weights.get('kline_factor', 0.5)
-        f = base_weights.get('fundamental', 0.3)
-        q = base_weights.get('technical', 0.2)
+        v = self._to_float(base_weights.get('kline_factor', 0.5), 0.5)
+        f = self._to_float(base_weights.get('fundamental', 0.3), 0.3)
+        q = self._to_float(base_weights.get('technical', 0.2), 0.2)
 
-        # 趋势越强 -> 视觉/技术权重上调；波动越高 -> 基本面权重上调
-        v_adj = v * (0.8 + 0.4 * trend_score) * (1 - 0.2 * vol_penalty)
-        q_adj = q * (0.8 + 0.3 * trend_score) * (1 - 0.3 * vol_penalty)
-        f_adj = f * (1.2 - 0.3 * trend_score) * (1 + 0.3 * vol_penalty)
+        # 趋势越强 -> 视觉/技术上调；波动/回撤/尾部风险越高 -> 基本面上调
+        v_adj = v * (0.75 + 0.60 * trend_score) * (1 - 0.35 * vol_score) * (1 - 0.25 * dd_score)
+        q_adj = q * (0.80 + 0.45 * trend_score) * (1 - 0.40 * vol_score) * (1 - 0.20 * dd_score)
+        f_adj = f * (1.05 + 0.35 * vol_score + 0.30 * dd_score + 0.15 * tail_score) * (1 - 0.20 * trend_score) * (1 + 0.10 * skew_penalty)
+
+        v_adj = max(v_adj, 1e-6)
+        q_adj = max(q_adj, 1e-6)
+        f_adj = max(f_adj, 1e-6)
 
         regime_weights = {'kline_factor': v_adj, 'fundamental': f_adj, 'technical': q_adj}
         
@@ -298,10 +359,17 @@ class RegimeManager:
                 'trend_60': None if trend_60 is None else round(trend_60, 4),
                 'vol_60': None if vol_60 is None else round(vol_60, 4),
                 'trend_score': round(trend_score, 4),
-                'vol_penalty': round(vol_penalty, 4),
-                'formula': "w_V = base_V*(0.8+0.4*trend_score)*(1-0.2*vol_penalty); "
-                           "w_Q = base_Q*(0.8+0.3*trend_score)*(1-0.3*vol_penalty); "
-                           "w_F = base_F*(1.2-0.3*trend_score)*(1+0.3*vol_penalty)"
+                'vol_score': round(vol_score, 4),
+                'dd_score': round(dd_score, 4),
+                'max_drawdown_120': None if drawdown_120 is None else round(drawdown_120, 4),
+                'skew_60': None if skew_60 is None else round(skew_60, 4),
+                'kurt_60': None if kurt_60 is None else round(kurt_60, 4),
+                'tail_score': round(tail_score, 4),
+                'skew_penalty': round(skew_penalty, 4),
+                'formula': "w_V=base_V*(0.75+0.60*trend_score)*(1-0.35*vol_score)*(1-0.25*dd_score); "
+                           "w_Q=base_Q*(0.80+0.45*trend_score)*(1-0.40*vol_score)*(1-0.20*dd_score); "
+                           "w_F=base_F*(1.05+0.35*vol_score+0.30*dd_score+0.15*tail_score)"
+                           "*(1-0.20*trend_score)*(1+0.10*skew_penalty)"
             }
         }
 

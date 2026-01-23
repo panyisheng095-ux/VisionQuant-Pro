@@ -235,7 +235,25 @@ def _run_simple_backtest(df, symbol, bt_cap, bt_ma, bt_stop, bt_vision, eng, PRO
     # Transaction Cost 明细（Q4：ABCD）
     if cost_summary:
         with st.expander("💸 交易成本明细", expanded=False):
-            st.json(cost_summary)
+            cn_map = {
+                "total_cost": "总成本",
+                "commission": "佣金",
+                "slippage": "滑点成本",
+                "market_impact": "市场冲击",
+                "opportunity_cost": "机会成本",
+                "trade_count": "交易次数"
+            }
+            rows = []
+            for k, v in cost_summary.items():
+                label = cn_map.get(k)
+                if not label:
+                    continue
+                val = v
+                if isinstance(val, (int, float)):
+                    val = round(float(val), 2)
+                rows.append({"指标": label, "数值": val})
+            if rows:
+                st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
 def _calc_indicators(df, bt_ma):
     """计算技术指标"""

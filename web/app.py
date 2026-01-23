@@ -101,21 +101,66 @@ def _augment_matches(matches, query_img_path, query_prices, loader, vision_engin
         return matches
     strict_list = []
     relaxed_list = []
-    def _seg_signs(prices):
+    def _segment_signs(prices):
         if prices is None or len(prices) < 6:
             return None
         n = len(prices)
-        seg = n // 3
-        head = prices[seg] - prices[0]
-        mid = prices[2 * seg] - prices[seg]
-        tail = prices[-1] - prices[2 * seg]
-        return [1 if x >= 0 else -1 for x in [head, mid, tail]]
+        s3 = n // 3
+        s5 = max(1, n // 5)
+        def _seg_ret(a, b):
+            if b - a < 2:
+                return None
+            return prices[b - 1] - prices[a]
+        segs = {
+            "head": (0, s3),
+            "mid": (s3, 2 * s3),
+            "tail": (2 * s3, n),
+            "front": (0, 2 * s3),
+            "back": (s3, n),
+            "start": (0, s5),
+            "end": (n - s5, n)
+        }
+        signs = {}
+        for k, (a, b) in segs.items():
+            v = _seg_ret(a, b)
+            if v is None:
+                continue
+            signs[k] = 1 if v >= 0 else -1
+        return signs if signs else None
+
+    def _segment_corrs(q, m):
+        if q is None or m is None or len(q) < 6 or len(m) < 6:
+            return None
+        n = min(len(q), len(m))
+        s3 = n // 3
+        s5 = max(1, n // 5)
+        segs = {
+            "head": (0, s3),
+            "mid": (s3, 2 * s3),
+            "tail": (2 * s3, n),
+            "front": (0, 2 * s3),
+            "back": (s3, n),
+            "start": (0, s5),
+            "end": (n - s5, n)
+        }
+        corr_map = {}
+        for k, (a, b) in segs.items():
+            if b - a < 3:
+                continue
+            qa = q[a:b]
+            ma = m[a:b]
+            qn = (qa - qa.mean()) / (qa.std() + 1e-8)
+            mn = (ma - ma.mean()) / (ma.std() + 1e-8)
+            c = np.corrcoef(qn, mn)[0, 1]
+            if not np.isnan(c):
+                corr_map[k] = float(c)
+        return corr_map if corr_map else None
 
     query_trend = None
     query_segs = None
     if query_prices is not None and len(query_prices) >= 6:
         query_trend = 1 if query_prices[-1] > query_prices[0] else -1
-        query_segs = _seg_signs(query_prices)
+        query_segs = _segment_signs(query_prices)
     q_pix = vision_engine._load_pixel_vector(query_img_path)
     q_edge = vision_engine._load_edge_vector(query_img_path)
     for i, m in enumerate(matches):
@@ -171,21 +216,25 @@ def _augment_matches(matches, query_img_path, query_prices, loader, vision_engin
                                 match_trend = 1 if match_prices[-1] > match_prices[0] else -1
                                 m["trend_match"] = 1 if match_trend == query_trend else 0
                                 if match_trend != query_trend:
-                                    trend_penalty = -0.08
+                                    trend_penalty = -0.12
+                            seg_agree_ratio = None
                             if filter_trend and query_segs is not None:
-                                match_segs = _seg_signs(match_prices)
+                                match_segs = _segment_signs(match_prices)
                                 if match_segs is not None:
-                                    seg_agree = sum(1 for a, b in zip(query_segs, match_segs) if a == b)
-                                    m["seg_score"] = seg_agree / 3.0
-                                    if seg_agree < 2:
-                                        seg_penalty = -0.06
+                                    keys = [k for k in query_segs.keys() if k in match_segs]
+                                    if keys:
+                                        agree = sum(1 for k in keys if query_segs[k] == match_segs[k])
+                                        seg_agree_ratio = agree / len(keys)
+                                        m["seg_agree"] = round(seg_agree_ratio, 4)
+                                        if seg_agree_ratio < 0.6:
+                                            seg_penalty = -0.10
                             qn = (query_prices - query_prices.mean()) / (query_prices.std() + 1e-8)
                             mn = (match_prices - match_prices.mean()) / (match_prices.std() + 1e-8)
                             corr = np.corrcoef(qn, mn)[0, 1]
                             if not np.isnan(corr):
                                 m["correlation"] = float(corr)
                                 if corr < 0:
-                                    corr_penalty = -0.05
+                                    corr_penalty = -0.15
                             q_ret = np.diff(query_prices) / (query_prices[:-1] + 1e-8)
                             m_ret = np.diff(match_prices) / (match_prices[:-1] + 1e-8)
                             q_ret = (q_ret - q_ret.mean()) / (q_ret.std() + 1e-8)
@@ -193,6 +242,24 @@ def _augment_matches(matches, query_img_path, query_prices, loader, vision_engin
                             corr2 = np.corrcoef(q_ret, m_ret)[0, 1]
                             if not np.isnan(corr2):
                                 m["ret_corr"] = float(corr2)
+                            # 多段相关性（模拟多头注意力）
+                            seg_corrs = _segment_corrs(query_prices, match_prices)
+                            if seg_corrs:
+                                m["seg_corr_head"] = seg_corrs.get("head")
+                                m["seg_corr_mid"] = seg_corrs.get("mid")
+                                m["seg_corr_tail"] = seg_corrs.get("tail")
+                                m["seg_corr_front"] = seg_corrs.get("front")
+                                m["seg_corr_back"] = seg_corrs.get("back")
+                                m["seg_corr_start"] = seg_corrs.get("start")
+                                m["seg_corr_end"] = seg_corrs.get("end")
+                                vals = list(seg_corrs.values())
+                                if vals:
+                                    seg_corr_mean = float(np.mean(vals))
+                                    seg_corr_norm = (seg_corr_mean + 1.0) / 2.0
+                                    m["seg_corr_mean"] = seg_corr_mean
+                                    m["seg_corr_norm"] = seg_corr_norm
+                                    if seg_corr_mean < 0:
+                                        seg_penalty -= 0.12
             except Exception:
                 pass
         # 形态综合评分（强调头/中/尾 + 相关性/回报相关）
@@ -201,16 +268,27 @@ def _augment_matches(matches, query_img_path, query_prices, loader, vision_engin
         if corr is None and ret_corr is not None:
             corr = ret_corr
         corr_norm = (float(corr) + 1.0) / 2.0 if corr is not None else 0.5
-        seg_score = m.get("seg_score", 0.5)
+        seg_score = m.get("seg_score", None)
+        seg_agree_ratio = m.get("seg_agree")
+        seg_corr_norm = m.get("seg_corr_norm")
+        if seg_score is None:
+            parts = []
+            if seg_agree_ratio is not None:
+                parts.append(0.6 * float(seg_agree_ratio))
+            if seg_corr_norm is not None:
+                parts.append(0.4 * float(seg_corr_norm))
+            seg_score = float(np.mean(parts)) if parts else 0.5
+            m["seg_score"] = seg_score
         pix = m.get("pixel_sim", m.get("score", m.get("sim_score", 0.5)))
         trend_match = m.get("trend_match", 1)
-        shape_score = 0.50 * corr_norm + 0.30 * seg_score + 0.10 * pix + 0.10 * trend_match
+        seg_corr_norm = seg_corr_norm if seg_corr_norm is not None else 0.5
+        shape_score = 0.45 * corr_norm + 0.25 * seg_score + 0.15 * seg_corr_norm + 0.10 * pix + 0.05 * trend_match
 
         base_score = m.get("score", m.get("sim_score", 0.0))
         m["score"] = float(shape_score) + trend_penalty + seg_penalty + corr_penalty
 
         # 严格候选：趋势一致 + 段落一致 + 相关性非负
-        if trend_match == 1 and seg_score >= 0.67 and (corr is None or corr >= 0):
+        if trend_match == 1 and (seg_agree_ratio is None or seg_agree_ratio >= 0.7) and (corr is None or corr >= 0) and (m.get("seg_corr_mean") is None or m.get("seg_corr_mean") >= 0):
             strict_ok = True
 
         if strict_ok:
@@ -221,6 +299,36 @@ def _augment_matches(matches, query_img_path, query_prices, loader, vision_engin
     strict_list.sort(key=lambda x: x.get("score", 0), reverse=True)
     relaxed_list.sort(key=lambda x: x.get("score", 0), reverse=True)
     return strict_list + relaxed_list
+
+
+def _filter_trend_matches(matches, top_k: int = 10, require_corr_nonneg: bool = True):
+    """
+    严格确保大趋势一致，优先保留趋势一致且相关性非负的候选
+    """
+    if not matches:
+        return matches
+
+    def _is_trend_ok(m):
+        if m.get("trend_match") != 1:
+            return False
+        if require_corr_nonneg:
+            corr = m.get("correlation")
+            if corr is not None and corr < 0:
+                return False
+        return True
+
+    strict = [m for m in matches if _is_trend_ok(m)]
+    if len(strict) >= top_k:
+        return strict[:top_k]
+
+    # 放宽相关性限制（但仍要求趋势一致）
+    relaxed = [m for m in matches if m.get("trend_match") == 1 and m not in strict]
+    combined = strict + relaxed
+    if len(combined) >= top_k:
+        return combined[:top_k]
+
+    # 仍不足则返回已筛选结果（绘图会补空位）
+    return combined
 
 st.set_page_config(page_title="VisionQuant Pro", layout="wide", page_icon="🦄")
 st.markdown("""
@@ -298,7 +406,7 @@ with st.sidebar:
     mode = st.radio("功能模块:", ("🔍 单只股票分析", "📊 批量组合分析"), key="mode_select")
 
     if mode == "🔍 单只股票分析":
-    st.divider()
+        st.divider()
         st.caption("回测 / 因子有效性分析入口已统一放在“单只股票分析”报告底部 Tab 中（更符合使用路径）。")
     
     elif mode == "📊 批量组合分析":
@@ -361,7 +469,7 @@ if mode == "🔍 单只股票分析":
         with st.spinner(f"正在全栈扫描 {symbol}..."):
             try:
                 logger.info(f"开始分析股票: {symbol}")
-            df = eng["loader"].get_stock_data(symbol)
+                df = eng["loader"].get_stock_data(symbol)
                 if df.empty: 
                     st.error("数据获取失败")
                     logger.error(f"数据获取失败: {symbol}")
@@ -387,15 +495,17 @@ if mode == "🔍 单只股票分析":
             date_str = df.index[-1].strftime("%Y%m%d")
             q_p = _find_existing_kline_image(symbol, date_str, eng.get("vision"))
             if not q_p:
-            q_p = os.path.join(PROJECT_ROOT, "data", "temp_q.png")
-            mc = mpf.make_marketcolors(up='red', down='green', inherit=True)
-            s = mpf.make_mpf_style(marketcolors=mc, gridstyle='')
-            mpf.plot(df.tail(20), type='candle', style=s, savefig=dict(fname=q_p, dpi=50), figsize=(3, 3), axisoff=True)
+                q_p = os.path.join(PROJECT_ROOT, "data", "temp_q.png")
+                mc = mpf.make_marketcolors(up='red', down='green', inherit=True)
+                s = mpf.make_mpf_style(marketcolors=mc, gridstyle='')
+                mpf.plot(df.tail(20), type='candle', style=s, savefig=dict(fname=q_p, dpi=50), figsize=(3, 3), axisoff=True)
             progress.progress(45)
             
             query_prices = df.tail(20)['Close'].values if len(df) >= 20 else None
             # 多尺度检索（日/周/月）+ 动态权重融合
             status.write("相似形态检索中...")
+            target_k = 10
+            search_k = 80
             try:
                 from src.data.multi_scale_generator import MultiScaleChartGenerator
                 gen = MultiScaleChartGenerator(figsize=(3, 3), dpi=50)
@@ -431,14 +541,17 @@ if mode == "🔍 单只股票分析":
                     scale_weights = None
 
                 matches = eng["vision"].search_multi_scale_patterns(
-                    img_paths, top_k=10, query_prices=query_prices, weights=scale_weights, max_date=date_str
+                    img_paths, top_k=search_k, query_prices=query_prices, weights=scale_weights, max_date=date_str
                 )
             except Exception:
-                matches = eng["vision"].search_similar_patterns(q_p, top_k=10, query_prices=query_prices, max_date=date_str)
+                matches = eng["vision"].search_similar_patterns(
+                    q_p, top_k=search_k, query_prices=query_prices, max_date=date_str
+                )
             progress.progress(65)
 
             # 补齐相似度字段，减少 N/A
             matches = _augment_matches(matches, q_p, query_prices, eng["loader"], eng["vision"], os.path.join(PROJECT_ROOT, "data"), filter_trend=True)
+            matches = _filter_trend_matches(matches, top_k=target_k)
             progress.progress(75)
 
             def get_future_trajectories(matches, loader):
@@ -623,6 +736,11 @@ if mode == "🔍 单只股票分析":
                 vector_score = m.get("vector_score")
                 corr = m.get("correlation")
                 sim_score = m.get("sim_score")
+                seg_agree = m.get("seg_agree")
+                seg_corr_mean = m.get("seg_corr_mean")
+                head_corr = m.get("seg_corr_head")
+                mid_corr = m.get("seg_corr_mid")
+                tail_corr = m.get("seg_corr_tail")
                 if sim_score is None:
                     if vector_score is not None:
                         sim_score = 1.0 / (1.0 + max(float(vector_score), 0.0))
@@ -640,6 +758,11 @@ if mode == "🔍 单只股票分析":
                     "边缘相似": round(float(edge_sim), 4) if edge_sim is not None else 0.0,
                     "相关性": round(float(corr_norm), 4) if corr_norm is not None else 0.0,
                     "回报相关": round(float((ret_corr+1)/2), 4) if ret_corr is not None else 0.0,
+                    "段落一致": round(float(seg_agree), 4) if seg_agree is not None else 0.0,
+                    "分段相关均值": round(float(seg_corr_mean), 4) if seg_corr_mean is not None else 0.0,
+                    "头段相关": round(float(head_corr), 4) if head_corr is not None else 0.0,
+                    "中段相关": round(float(mid_corr), 4) if mid_corr is not None else 0.0,
+                    "尾段相关": round(float(tail_corr), 4) if tail_corr is not None else 0.0,
                     "最终分": round(float(m.get("score", 0)), 4)
                 })
             with st.expander("🔍 相似度分解（可解释）", expanded=False):
@@ -774,14 +897,66 @@ if mode == "🔍 单只股票分析":
         c_left, c_right = st.columns([1.5, 1])
         with c_left:
             st.subheader("2. 量化多因子看板")
+            det = d.get("det", {})
+
+            def _build_weights_payload():
+                payload = {
+                    "视觉权重": det.get("视觉权重"),
+                    "财务权重": det.get("财务权重"),
+                    "量化权重": det.get("量化权重"),
+                    "regime": det.get("regime"),
+                    "权重说明": det.get("权重说明"),
+                    "权重更新时间": det.get("权重更新时间"),
+                    "source": "dynamic",
+                    "error": None
+                }
+                if payload["视觉权重"] is None or not payload["权重说明"]:
+                    try:
+                        from src.strategies.regime_manager import RegimeManager
+                        rm = RegimeManager(data_loader=eng["loader"])
+                        df_tmp = d.get("df_f")
+                        returns_tmp = None
+                        if df_tmp is not None and "Close" in df_tmp.columns:
+                            returns_tmp = pd.to_numeric(df_tmp["Close"], errors="coerce").pct_change().dropna()
+                        dyn = rm.calculate_dynamic_weights(
+                            returns=returns_tmp if returns_tmp is not None and not returns_tmp.empty else None
+                        )
+                        w = dyn.get("weights", {})
+                        payload.update({
+                            "视觉权重": w.get("kline_factor"),
+                            "财务权重": w.get("fundamental"),
+                            "量化权重": w.get("technical"),
+                            "regime": dyn.get("regime"),
+                            "权重说明": dyn.get("explain"),
+                            "权重更新时间": dyn.get("timestamp"),
+                            "source": "dynamic"
+                        })
+                    except Exception as e:
+                        payload["source"] = "fixed"
+                        payload["error"] = str(e)
+
+                if payload["视觉权重"] is None:
+                    payload.update({
+                        "视觉权重": 0.6,
+                        "财务权重": 0.2,
+                        "量化权重": 0.2,
+                        "regime": payload.get("regime") or "unknown",
+                        "source": "fixed"
+                    })
+                return payload
+
+            weights_payload = _build_weights_payload()
+            explain = weights_payload.get("权重说明") or {}
+
             with st.expander("ℹ️ 因子说明", expanded=False):
                 st.markdown("""
                 **多因子评分系统 (V+F+Q)**:
-                - **V (视觉因子)**: K线学习因子胜率，权重60%
-                - **F (基本面因子)**: ROE、PE、PB等，权重20%
-                - **Q (技术因子)**: MA、RSI、MACD等，权重20%
-                - **动态权重**: 根据市场regime自动调整
+                - **V (视觉因子)**: K线学习因子胜率
+                - **F (基本面因子)**: ROE、PE、PB等
+                - **Q (技术因子)**: MA、RSI、MACD等
+                - **动态权重**: 根据 Regime + 统计风控因子自动调整
                 """)
+                st.caption("权重与公式详见下方 🧭 Regime 动态权重（算法与公式）")
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("AI 总评分", f"{d['score']}/10", delta=d['act'])
             fund_ok = (d.get("fund", {}) or {}).get("_ok", {})
@@ -795,38 +970,63 @@ if mode == "🔍 单只股票分析":
                 with col_a:
                     st.write("**杜邦拆解**")
                     if fund_ok.get("finance"):
-                    st.write(f"净利率: {d['fund'].get('net_profit_margin')}%")
-                    st.write(f"周转率: {d['fund'].get('asset_turnover')}")
-                    st.write(f"权益乘数: {d['fund'].get('leverage')}x")
+                        st.write(f"净利率: {d['fund'].get('net_profit_margin')}%")
+                        st.write(f"周转率: {d['fund'].get('asset_turnover')}")
+                        st.write(f"权益乘数: {d['fund'].get('leverage')}x")
                 with col_b:
                     st.write("**技术因子**")
-                    st.json(d['det'])
+                    tech_row = None
+                    try:
+                        df_tmp = d.get("df_f")
+                        if df_tmp is not None and not df_tmp.empty:
+                            tech_row = df_tmp.iloc[-1]
+                    except Exception:
+                        tech_row = None
+                    if tech_row is not None:
+                        rows = []
+                        ma_signal = tech_row.get("MA_Signal", None)
+                        rsi = tech_row.get("RSI", None)
+                        macd_hist = tech_row.get("MACD_Hist", None)
+                        rows.append({
+                            "指标": "均线趋势",
+                            "数值": "看涨" if ma_signal is not None and float(ma_signal) > 0 else "看跌"
+                        })
+                        if rsi is not None:
+                            rows.append({"指标": "RSI", "数值": round(float(rsi), 2)})
+                        if macd_hist is not None:
+                            rows.append({"指标": "MACD柱", "数值": round(float(macd_hist), 4)})
+                        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                    else:
+                        st.info("技术因子暂不可用")
 
             # 解释性评分（V/F/Q贡献）
-            det = d.get("det", {})
-            if det.get("视觉权重") is not None or det.get("regime"):
-                with st.expander("🧭 Regime 动态权重", expanded=False):
-                    st.write(f"当前Regime: {det.get('regime', 'N/A')}")
-                    weights_df = pd.DataFrame([
-                        {"因子": "视觉(V)", "权重": det.get("视觉权重", "N/A")},
-                        {"因子": "基本面(F)", "权重": det.get("财务权重", "N/A")},
-                        {"因子": "技术(Q)", "权重": det.get("量化权重", "N/A")},
-                    ])
-                    st.dataframe(weights_df, use_container_width=True, hide_index=True)
-                    explain = det.get("权重说明") or {}
-                    if explain:
-                        st.caption(f"权重更新时间: {det.get('权重更新时间', 'N/A')}")
-                        st.write("权重计算逻辑（统计/算法）：")
-                        base_w = explain.get("base_weights", {})
-                        base_df = pd.DataFrame([
-                            {"因子": "视觉(V)", "基准权重": base_w.get("kline_factor")},
-                            {"因子": "基本面(F)", "基准权重": base_w.get("fundamental")},
-                            {"因子": "技术(Q)", "基准权重": base_w.get("technical")},
-                        ])
-                        st.dataframe(base_df, use_container_width=True, hide_index=True)
-                        st.write(f"趋势均值(年化): {explain.get('trend_60')} | 波动率(年化): {explain.get('vol_60')}")
-                        st.write(f"趋势得分: {explain.get('trend_score')} | 波动惩罚: {explain.get('vol_penalty')}")
-                        st.caption(f"公式: {explain.get('formula')}")
+            st.subheader("🧭 Regime 动态权重（算法与公式）")
+            with st.expander("展开查看权重与公式", expanded=True):
+                if weights_payload.get("source") == "fixed" and weights_payload.get("error"):
+                    st.warning(f"动态权重补算失败，已回退固定权重：{weights_payload.get('error')}")
+
+                st.write(f"当前Regime: {weights_payload.get('regime', 'N/A')}")
+                weights_df = pd.DataFrame([
+                    {"因子": "视觉(V)", "权重": weights_payload.get("视觉权重")},
+                    {"因子": "基本面(F)", "权重": weights_payload.get("财务权重")},
+                    {"因子": "技术(Q)", "权重": weights_payload.get("量化权重")},
+                ])
+                st.dataframe(weights_df, use_container_width=True, hide_index=True)
+                if explain:
+                    st.caption(f"权重更新时间: {weights_payload.get('权重更新时间', 'N/A')}")
+                    st.write("权重计算逻辑（统计/算法）：")
+                    st.write(
+                        f"趋势均值(年化): {explain.get('trend_60')} | 波动率(年化): {explain.get('vol_60')} | 最大回撤(120D): {explain.get('max_drawdown_120')}"
+                    )
+                    st.write(
+                        f"偏度: {explain.get('skew_60')} | 峰度: {explain.get('kurt_60')} | 尾部风险: {explain.get('tail_score')}"
+                    )
+                    st.write(
+                        f"趋势得分: {explain.get('trend_score')} | 波动评分: {explain.get('vol_score')} | 回撤评分: {explain.get('dd_score')}"
+                    )
+                    st.caption(f"公式：{explain.get('formula')}")
+                else:
+                    st.info("当前暂无可用的权重说明（已回退固定权重）。")
             try:
                 v = float(det.get("视觉分(V)", 0))
                 f = float(det.get("财务分(F)", 0))
@@ -837,7 +1037,8 @@ if mode == "🔍 单只股票分析":
                     {"因子": "基本面(F)", "贡献": f"{f/total*100:.1f}%"},
                     {"因子": "技术(Q)", "贡献": f"{q/total*100:.1f}%"},
                 ])
-                with st.expander("🧠 可解释性评分贡献", expanded=False):
+                with st.expander("🧠 评分占比（非权重）", expanded=False):
+                    st.caption("说明：这里展示的是分数构成占比，不等同于权重。")
                     st.dataframe(contrib, use_container_width=True, hide_index=True)
             except Exception:
                 pass
@@ -846,7 +1047,7 @@ if mode == "🔍 单只股票分析":
         with c_right:
             st.subheader(f"3. 行业对标 ({d['ind']})")
             if d['peers'] is not None and not d['peers'].empty:
-            st.dataframe(d['peers'], hide_index=True)
+                st.dataframe(d['peers'], hide_index=True)
             else:
                 st.warning(f"⚠️ 行业对标数据暂不可用（行业: {d['ind']}）")
                 if d.get("fund", {}).get("_err"):
@@ -873,7 +1074,7 @@ if mode == "🔍 单只股票分析":
                 st.markdown("""
                 **回测策略逻辑**:
                 - **仓位计算**: 基于MA60、MA20、MACD和AI胜率阈值
-                - **Transaction Cost**: 佣金(0.1%) + 滑点(0.1%) + 市场冲击 + 机会成本
+                - **交易成本**: 佣金(0.1%) + 滑点(0.1%) + 市场冲击 + 机会成本
                 - **Turnover约束**: 单日最大换手率20%
                 - **涨跌停/停牌约束**: 涨停不追、跌停不砍、停牌不交易（A股执行约束）
                 - **止损机制**: 达到止损阈值(-8%)时强制平仓
@@ -1004,7 +1205,7 @@ if mode == "🔍 单只股票分析":
         if audio:
             transcribed = eng["audio"].transcribe(audio['bytes'])
             if transcribed and transcribed != st.session_state.last_voice_text:
-                    user_voice_text = transcribed
+                user_voice_text = transcribed
                 st.session_state.last_voice_text = transcribed
         with c_input:
             text_input = st.chat_input("输入问题...")
@@ -1229,7 +1430,7 @@ elif mode == "📊 批量组合分析":
                     strat_df = run_stratified_backtest_batch(list(batch_results.keys()), eng)
                     if strat_df is not None and not strat_df.empty:
                         st.dataframe(strat_df, use_container_width=True, hide_index=True)
-                        else:
+                    else:
                         st.info("分层样本不足或数据不可用")
 
             # 权重动态变化（简化：基于20日动量的月度再平衡）
@@ -1304,5 +1505,5 @@ elif mode == "📊 批量组合分析":
                         st.write(f"{data.get('action', 'WAIT')} - {data.get('reasoning', '')[:50]}")
                     st.divider()
     
-                else:
+    else:
         st.info("👈 请在左侧输入股票代码并点击启动")
