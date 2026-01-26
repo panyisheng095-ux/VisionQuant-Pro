@@ -353,6 +353,61 @@ class DataLoader:
             logger.warning("时间索引切片失败 %s: %s", symbol, e)
         return pd.DataFrame()
 
+    def get_index_data(self, index_code, start_date=DEFAULT_START_DATE, end_date=None, use_cache: bool = False):
+        """
+        获取指数OHLCV数据（优先当前数据源，失败回退Akshare）
+        注意：此接口默认不走缓存，以保证情绪类指标的实时性。
+        """
+        def _to_dt(value, default_dt):
+            if value is None or str(value).strip() == "":
+                return default_dt
+            try:
+                dt = pd.to_datetime(value, errors="coerce")
+                return default_dt if pd.isna(dt) else dt
+            except Exception:
+                return default_dt
+
+        req_start_dt = _to_dt(start_date, pd.to_datetime(DEFAULT_START_DATE))
+        req_end_dt = _to_dt(end_date, pd.to_datetime(datetime.now().strftime("%Y%m%d")))
+        if req_end_dt < req_start_dt:
+            req_end_dt = req_start_dt
+        start_date = req_start_dt.strftime("%Y%m%d")
+        end_date = req_end_dt.strftime("%Y%m%d")
+
+        index_code = str(index_code).strip()
+        df = pd.DataFrame()
+
+        # 当前数据源
+        if self.data_source and self.data_source.is_available():
+            try:
+                df = self.data_source.get_index_data(
+                    index_code=index_code,
+                    start_date=start_date,
+                    end_date=end_date
+                )
+            except Exception as e:
+                logger.warning("指数数据获取失败 [%s]: %s", self.data_source_name, e)
+
+        # 回退到Akshare
+        if (df is None or df.empty) and self.data_source_name != 'akshare':
+            try:
+                fallback_source = AkshareDataSource()
+                if fallback_source.is_available():
+                    df = fallback_source.get_index_data(
+                        index_code=index_code,
+                        start_date=start_date,
+                        end_date=end_date
+                    )
+            except Exception as e:
+                logger.warning("指数数据回退失败 [akshare]: %s", e)
+
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        df = self._normalize_columns(df)
+        df = self._ensure_datetime_index(df)
+        return df
+
     def _ensure_datetime_index(self, df: pd.DataFrame) -> pd.DataFrame:
         """确保索引为DatetimeIndex，避免Timestamp切片异常"""
         if df is None or df.empty:

@@ -42,6 +42,9 @@ def _code_version_key():
     paths = [
         os.path.join(PROJECT_ROOT, "src", "models", "vision_engine.py"),
         os.path.join(PROJECT_ROOT, "src", "strategies", "fundamental.py"),
+        os.path.join(PROJECT_ROOT, "src", "data", "data_loader.py"),
+        os.path.join(PROJECT_ROOT, "src", "data", "data_source.py"),
+        os.path.join(PROJECT_ROOT, "src", "agent", "quant_agent.py"),
     ]
     return "|".join([str(os.path.getmtime(p)) if os.path.exists(p) else "0" for p in paths])
 
@@ -95,6 +98,202 @@ def _render_match_image(symbol: str, date_str: str, loader, out_path: str):
         return out_path
     except Exception:
         return None
+
+def _compute_market_sentiment(loader, index_code: str = "000300", end_dt=None):
+    """
+    大盘情绪（后验）：基于沪深300指数的趋势/波动/回撤/量能综合评分
+    """
+    result = {"ok": False, "index_code": index_code}
+    try:
+        end_dt = pd.to_datetime(end_dt or datetime.now(), errors="coerce")
+        if pd.isna(end_dt):
+            end_dt = pd.to_datetime(datetime.now())
+        start_dt = end_dt - pd.Timedelta(days=450)
+        df = None
+        last_err = None
+        
+        # 方法1: loader.get_index_data
+        if hasattr(loader, "get_index_data"):
+            try:
+                df = loader.get_index_data(
+                    index_code=index_code,
+                    start_date=start_dt.strftime("%Y%m%d"),
+                    end_date=end_dt.strftime("%Y%m%d"),
+                )
+                if df is not None and not df.empty:
+                    logger.info(f"✅ 大盘数据获取成功 [loader.get_index_data]: {len(df)} 条")
+            except Exception as e:
+                last_err = f"loader.get_index_data: {type(e).__name__}: {e}"
+                logger.warning(f"⚠️ {last_err}")
+        
+        # 方法2: loader.data_source.get_index_data
+        if (df is None or df.empty) and hasattr(loader, "data_source") and loader.data_source is not None:
+            if hasattr(loader.data_source, "get_index_data"):
+                try:
+                    df = loader.data_source.get_index_data(
+                        index_code=index_code,
+                        start_date=start_dt.strftime("%Y%m%d"),
+                        end_date=end_dt.strftime("%Y%m%d"),
+                    )
+                    if df is not None and not df.empty:
+                        logger.info(f"✅ 大盘数据获取成功 [data_source.get_index_data]: {len(df)} 条")
+                except Exception as e:
+                    last_err = f"data_source.get_index_data: {type(e).__name__}: {e}"
+                    logger.warning(f"⚠️ {last_err}")
+        
+        # 方法3: 直接调用 akshare
+        if df is None or df.empty:
+            try:
+                import akshare as ak
+                from src.utils.net_utils import no_proxy_env
+                with no_proxy_env():
+                    df = ak.index_zh_a_hist(
+                        symbol=index_code,
+                        period="daily",
+                        start_date=start_dt.strftime("%Y%m%d"),
+                        end_date=end_dt.strftime("%Y%m%d"),
+                    )
+                if df is not None and not df.empty:
+                    logger.info(f"✅ 大盘数据获取成功 [ak.index_zh_a_hist]: {len(df)} 条")
+                    # 标准化列名
+                    df = loader._normalize_columns(df) if hasattr(loader, "_normalize_columns") else df
+                    df = loader._ensure_datetime_index(df) if hasattr(loader, "_ensure_datetime_index") else df
+            except Exception as e:
+                last_err = f"ak.index_zh_a_hist: {type(e).__name__}: {e}"
+                logger.error(f"❌ {last_err}")
+        
+        if df is None or df.empty:
+            result["error"] = f"指数数据不可用: {last_err or '所有方法均失败'}"
+            return result
+        
+        if "Close" not in df.columns:
+            result["error"] = f"指数数据缺少Close列，现有列: {list(df.columns)}"
+            return result
+        df = df.copy()
+        df.index = pd.to_datetime(df.index, errors="coerce")
+        df = df[~df.index.isna()].sort_index()
+
+        close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+        if close.empty or len(close) < 40:
+            result["error"] = "指数数据长度不足"
+            return result
+
+        def _safe_ret(series, n):
+            if len(series) <= n:
+                return None
+            return float(series.iloc[-1] / series.iloc[-n - 1] - 1.0)
+
+        ret_1d = _safe_ret(close, 1)
+        ret_5d = _safe_ret(close, 5)
+        ret_20d = _safe_ret(close, 20)
+
+        returns = close.pct_change().dropna()
+        vol_20d = float(returns.tail(20).std() * np.sqrt(252)) if len(returns) >= 20 else None
+
+        # 周度（W-FRI）收益与波动
+        weekly_close = close.resample("W-FRI").last().dropna()
+        weekly_ret_1 = _safe_ret(weekly_close, 1) if len(weekly_close) >= 2 else None
+        weekly_ret_4 = _safe_ret(weekly_close, 4) if len(weekly_close) >= 5 else None
+        weekly_vol_8 = float(weekly_close.pct_change().tail(8).std() * np.sqrt(52)) if len(weekly_close) >= 10 else None
+
+        # 最大回撤（近60日）
+        window_close = close.tail(60)
+        roll_max = window_close.cummax()
+        dd_60 = float((window_close / roll_max - 1.0).min()) if not window_close.empty else None
+
+        # 量能与振幅（近20日）
+        vol_ratio = None
+        amp_20 = None
+        if "Volume" in df.columns:
+            volume = pd.to_numeric(df["Volume"], errors="coerce").dropna()
+            if len(volume) >= 20:
+                vol_ratio = float(volume.iloc[-1] / (volume.tail(20).mean() + 1e-8))
+        if "High" in df.columns and "Low" in df.columns:
+            high = pd.to_numeric(df["High"], errors="coerce")
+            low = pd.to_numeric(df["Low"], errors="coerce")
+            amp = (high - low) / close.reindex(high.index)
+            amp_20 = float(amp.tail(20).mean()) if len(amp.dropna()) >= 20 else None
+
+        def _tanh(x, scale=1.0):
+            try:
+                return float(np.tanh(float(x) * scale))
+            except Exception:
+                return 0.0
+
+        trend_component = (
+            0.5 * _tanh(ret_20d or 0.0, 3.0)
+            + 0.3 * _tanh(ret_5d or 0.0, 4.0)
+            + 0.2 * _tanh(weekly_ret_4 or 0.0, 2.0)
+        )
+        vol_component = _tanh(vol_20d or 0.0, 2.0)
+        dd_component = _tanh(abs(dd_60 or 0.0), 5.0)
+        volume_component = _tanh((vol_ratio or 1.0) - 1.0, 2.0) if vol_ratio is not None else 0.0
+        amp_component = _tanh(amp_20 or 0.0, 5.0) if amp_20 is not None else 0.0
+
+        raw_score = (
+            0.6 * trend_component
+            + 0.2 * volume_component
+            - 0.1 * vol_component
+            - 0.1 * dd_component
+            - 0.05 * amp_component
+        )
+        score = int(np.clip(50 + raw_score * 50, 0, 100))
+
+        if score >= 70:
+            label = "乐观偏多"
+        elif score >= 60:
+            label = "偏多"
+        elif score >= 40:
+            label = "中性"
+        elif score >= 30:
+            label = "偏空"
+        else:
+            label = "谨慎偏空"
+
+        result.update({
+            "ok": True,
+            "latest_date": close.index[-1].strftime("%Y-%m-%d"),
+            "latest_close": float(close.iloc[-1]),
+            "ret_1d": ret_1d,
+            "ret_5d": ret_5d,
+            "ret_20d": ret_20d,
+            "weekly_ret_1": weekly_ret_1,
+            "weekly_ret_4": weekly_ret_4,
+            "vol_20d": vol_20d,
+            "weekly_vol_8": weekly_vol_8,
+            "max_drawdown_60d": dd_60,
+            "volume_ratio": vol_ratio,
+            "amplitude_20d": amp_20,
+            "score": score,
+            "label": label,
+            "formula": "情绪=50+50*(0.6*趋势+0.2*量能-0.1*波动-0.1*回撤-0.05*振幅)",
+            "series_dates": close.tail(120).index.strftime("%Y-%m-%d").tolist(),
+            "series_values": close.tail(120).round(4).tolist()
+        })
+        return result
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+        return result
+
+def _safe_get_fundamentals(fund, symbol, force_live: bool):
+    try:
+        return fund.get_stock_fundamentals(symbol, force_live=force_live)
+    except TypeError:
+        # 兼容旧版本（无 force_live 参数）
+        return fund.get_stock_fundamentals(symbol)
+
+def _safe_get_industry_peers(fund, symbol, force_live: bool):
+    try:
+        return fund.get_industry_peers(symbol, force_live=force_live)
+    except TypeError:
+        return fund.get_industry_peers(symbol)
+
+def _safe_ai_analyze(agent, *args, **kwargs):
+    try:
+        return agent.analyze(*args, **kwargs)
+    except TypeError:
+        kwargs.pop("market_sentiment", None)
+        return agent.analyze(*args, **kwargs)
 
 def _augment_matches(matches, query_img_path, query_prices, loader, vision_engine, tmp_dir, filter_trend: bool = True):
     if not matches:
@@ -281,6 +480,8 @@ def _augment_matches(matches, query_img_path, query_prices, loader, vision_engin
             m["seg_score"] = seg_score
         pix = m.get("pixel_sim", m.get("score", m.get("sim_score", 0.5)))
         trend_match = m.get("trend_match", 1)
+        if m.get("trend_match") is None:
+            m["trend_match"] = trend_match
         seg_corr_norm = seg_corr_norm if seg_corr_norm is not None else 0.5
         shape_score = 0.45 * corr_norm + 0.25 * seg_score + 0.15 * seg_corr_norm + 0.10 * pix + 0.05 * trend_match
 
@@ -327,8 +528,18 @@ def _filter_trend_matches(matches, top_k: int = 10, require_corr_nonneg: bool = 
     if len(combined) >= top_k:
         return combined[:top_k]
 
-    # 仍不足则返回已筛选结果（绘图会补空位）
-    return combined
+    # 仍不足则回填原始候选，避免Top10空缺
+    if len(combined) < top_k:
+        seen = {(m.get("symbol"), m.get("date")) for m in combined}
+        for m in matches:
+            key = (m.get("symbol"), m.get("date"))
+            if key in seen:
+                continue
+            combined.append(m)
+            seen.add(key)
+            if len(combined) >= top_k:
+                break
+    return combined[:top_k]
 
 st.set_page_config(page_title="VisionQuant Pro", layout="wide", page_icon="🦄")
 st.markdown("""
@@ -342,16 +553,20 @@ st.markdown("""
 
 @st.cache_resource
 def load_all_engines(_code_version: str):
+    dl_mod = importlib.import_module("src.data.data_loader")
     ve_mod = importlib.import_module("src.models.vision_engine")
     fm_mod = importlib.import_module("src.strategies.fundamental")
+    qa_mod = importlib.import_module("src.agent.quant_agent")
+    importlib.reload(dl_mod)
     importlib.reload(ve_mod)
     importlib.reload(fm_mod)
+    importlib.reload(qa_mod)
     v = ve_mod.VisionEngine()
     # 延迟加载索引：只在第一次搜索时加载，避免启动时20-30分钟的等待
     # v.reload_index()  # 已移除：索引将在第一次调用search_similar_patterns时自动加载
     return {
-        "loader": DataLoader(mem_cache_max=128), "vision": v, "factor": FactorMiner(),
-        "fund": fm_mod.FundamentalMiner(), "agent": QuantAgent(), 
+        "loader": dl_mod.DataLoader(mem_cache_max=128), "vision": v, "factor": FactorMiner(),
+        "fund": fm_mod.FundamentalMiner(), "agent": qa_mod.QuantAgent(), 
         "news": NewsHarvester(), "audio": AudioManager()
     }
 
@@ -469,11 +684,15 @@ if mode == "🔍 单只股票分析":
         with st.spinner(f"正在全栈扫描 {symbol}..."):
             try:
                 logger.info(f"开始分析股票: {symbol}")
-                df = eng["loader"].get_stock_data(symbol)
-                if df.empty: 
-                    st.error("数据获取失败")
-                    logger.error(f"数据获取失败: {symbol}")
-                    st.stop()
+                df = eng["loader"].get_stock_data(symbol, use_cache=False)
+                if df is None or df.empty:
+                    logger.warning(f"实时拉取失败，回退本地缓存: {symbol}")
+                    df = eng["loader"].get_stock_data(symbol, use_cache=True)
+                    if df is None or df.empty:
+                        st.error("数据获取失败")
+                        logger.error(f"数据获取失败: {symbol}")
+                        st.stop()
+                    st.warning("实时拉取失败，已回退本地缓存（仅本次展示）。")
             except Exception as e:
                 logger.exception(f"数据获取异常: {symbol}")
                 st.error(f"数据获取失败: {str(e)}")
@@ -487,21 +706,45 @@ if mode == "🔍 单只股票分析":
                 quality_report = {}
             progress.progress(30)
 
-            fund_data = eng["fund"].get_stock_fundamentals(symbol)
-            stock_name = fund_data.get('name', symbol)
+            def _has_valid_num(val):
+                try:
+                    return val is not None and np.isfinite(float(val)) and float(val) != 0
+                except Exception:
+                    return False
+
+            def _fund_ok(fd):
+                if not isinstance(fd, dict):
+                    return False
+                ok = fd.get("_ok", {}) or {}
+                if ok.get("spot") or ok.get("finance"):
+                    return True
+                return any([
+                    _has_valid_num(fd.get("pe_ttm")),
+                    _has_valid_num(fd.get("pb")),
+                    _has_valid_num(fd.get("total_mv")),
+                ])
+
+            # 基本面：先实时拉取，失败再回退缓存
+            fund_data = _safe_get_fundamentals(eng["fund"], symbol, force_live=True)
+            if not _fund_ok(fund_data):
+                fund_data = _safe_get_fundamentals(eng["fund"], symbol, force_live=False)
+            stock_name = fund_data.get('name') or symbol
             status.write("生成查询K线图...")
 
-            # 优先使用已存在的历史K线图（保证与索引同分布）
-            date_str = df.index[-1].strftime("%Y%m%d")
-            q_p = _find_existing_kline_image(symbol, date_str, eng.get("vision"))
-            if not q_p:
-                q_p = os.path.join(PROJECT_ROOT, "data", "temp_q.png")
-                mc = mpf.make_marketcolors(up='red', down='green', inherit=True)
-                s = mpf.make_mpf_style(marketcolors=mc, gridstyle='')
-                mpf.plot(df.tail(20), type='candle', style=s, savefig=dict(fname=q_p, dpi=50), figsize=(3, 3), axisoff=True)
+            # 始终用“最新行情”生成查询K线图（避免历史缓存图导致错配）
+            query_window = df.tail(20).copy()
+            if query_window is None or query_window.empty:
+                st.error("查询窗口不足，无法生成K线图")
+                st.stop()
+            query_dt = query_window.index[-1]
+            query_date_str = query_dt.strftime("%Y%m%d") if query_dt is not None else df.index[-1].strftime("%Y%m%d")
+            q_p = os.path.join(PROJECT_ROOT, "data", f"temp_q_{symbol}_{query_date_str}.png")
+            mc = mpf.make_marketcolors(up='red', down='green', inherit=True)
+            s = mpf.make_mpf_style(marketcolors=mc, gridstyle='')
+            mpf.plot(query_window, type='candle', style=s, savefig=dict(fname=q_p, dpi=50), figsize=(3, 3), axisoff=True)
             progress.progress(45)
             
-            query_prices = df.tail(20)['Close'].values if len(df) >= 20 else None
+            query_prices = query_window['Close'].values if query_window is not None and len(query_window) >= 20 else None
             # 多尺度检索（日/周/月）+ 动态权重融合
             status.write("相似形态检索中...")
             target_k = 10
@@ -511,8 +754,9 @@ if mode == "🔍 单只股票分析":
                 gen = MultiScaleChartGenerator(figsize=(3, 3), dpi=50)
                 q_week = os.path.join(PROJECT_ROOT, "data", "temp_q_week.png")
                 q_month = os.path.join(PROJECT_ROOT, "data", "temp_q_month.png")
-                gen.generate_weekly_chart(df, weeks=20, output_path=q_week)
-                gen.generate_monthly_chart(df, months=20, output_path=q_month)
+                df_for_query = df.loc[:query_dt] if query_dt is not None else df
+                gen.generate_weekly_chart(df_for_query, weeks=20, output_path=q_week)
+                gen.generate_monthly_chart(df_for_query, months=20, output_path=q_month)
                 img_paths = {"daily": q_p, "weekly": q_week, "monthly": q_month}
                 # 动态融合权重：基于各周期的收益分布质量评分
                 try:
@@ -520,20 +764,20 @@ if mode == "🔍 单只股票分析":
                     # 仅用于权重估计，使用快速模式减少耗时
                     scale_matches = {
                         "daily": eng["vision"].search_similar_patterns(
-                            q_p, top_k=10, query_prices=query_prices, max_date=date_str,
+                            q_p, top_k=10, query_prices=query_prices, max_date=query_date_str,
                             fast_mode=True, search_k=400, rerank_with_pixels=False
                         ),
                         "weekly": eng["vision"].search_similar_patterns(
-                            q_week, top_k=10, max_date=date_str,
+                            q_week, top_k=10, max_date=query_date_str,
                             fast_mode=True, search_k=400, rerank_with_pixels=False
                         ),
                         "monthly": eng["vision"].search_similar_patterns(
-                            q_month, top_k=10, max_date=date_str,
+                            q_month, top_k=10, max_date=query_date_str,
                             fast_mode=True, search_k=400, rerank_with_pixels=False
                         ),
                     }
                     scale_stats = {
-                        k: kline_factor_calc.calculate_return_distribution(v, horizon_days=5, query_date=date_str)
+                        k: kline_factor_calc.calculate_return_distribution(v, horizon_days=5, query_date=query_date_str)
                         for k, v in scale_matches.items()
                     }
                     scale_weights = kline_factor_calc.estimate_scale_weights(scale_stats)
@@ -541,11 +785,11 @@ if mode == "🔍 单只股票分析":
                     scale_weights = None
 
                 matches = eng["vision"].search_multi_scale_patterns(
-                    img_paths, top_k=search_k, query_prices=query_prices, weights=scale_weights, max_date=date_str
+                    img_paths, top_k=search_k, query_prices=query_prices, weights=scale_weights, max_date=query_date_str
                 )
             except Exception:
                 matches = eng["vision"].search_similar_patterns(
-                    q_p, top_k=search_k, query_prices=query_prices, max_date=date_str
+                    q_p, top_k=search_k, query_prices=query_prices, max_date=query_date_str
                 )
             progress.progress(65)
 
@@ -553,6 +797,9 @@ if mode == "🔍 单只股票分析":
             matches = _augment_matches(matches, q_p, query_prices, eng["loader"], eng["vision"], os.path.join(PROJECT_ROOT, "data"), filter_trend=True)
             matches = _filter_trend_matches(matches, top_k=target_k)
             progress.progress(75)
+
+            # 大盘情绪（沪深300，后验）
+            market_sentiment = _compute_market_sentiment(eng["loader"], index_code="000300", end_dt=query_dt)
 
             def get_future_trajectories(matches, loader):
                 trajectories, details = [], []
@@ -592,12 +839,13 @@ if mode == "🔍 单只股票分析":
 
             try:
                 kline_factor_calc = KLineFactorCalculator(data_loader=eng["loader"])
-                query_date_str = datetime.now().strftime('%Y%m%d')
+                query_date_for_calc = query_date_str if query_date_str else datetime.now().strftime('%Y%m%d')
+                query_df_for_calc = df.loc[:query_dt] if query_dt is not None else df
                 hybrid_win_rate_result = kline_factor_calc.calculate_hybrid_win_rate(
                     matches, 
                     query_symbol=symbol,
-                    query_date=query_date_str,
-                    query_df=df
+                    query_date=query_date_for_calc,
+                    query_df=query_df_for_calc
                 )
                 if isinstance(hybrid_win_rate_result, dict):
                     hybrid_win_rate = hybrid_win_rate_result.get('hybrid_win_rate', traditional_win_rate)
@@ -623,7 +871,18 @@ if mode == "🔍 单只股票分析":
 
             df_f = eng["factor"]._add_technical_indicators(df)
             news_text = eng["news"].get_latest_news(symbol)
-            ind_name, peers_df = eng["fund"].get_industry_peers(symbol)
+            # 行业对标：先实时拉取，失败再回退缓存
+            ind_name, peers_df = _safe_get_industry_peers(eng["fund"], symbol, force_live=True)
+            if (
+                not ind_name
+                or ind_name in ["未知", "上海主板", "深圳主板", "创业板", "科创板"]
+                or peers_df is None
+                or peers_df.empty
+                or len(peers_df) < 2
+            ):
+                ind_name, peers_df = _safe_get_industry_peers(eng["fund"], symbol, force_live=False)
+            if (not ind_name or ind_name == "未知") and fund_data.get("industry"):
+                ind_name = fund_data.get("industry")
             progress.progress(95)
 
             returns = df['Close'].pct_change().dropna()
@@ -645,7 +904,8 @@ if mode == "🔍 单只股票分析":
                 "news": news_text, "rep": report,
                 "mh_stats": mh_stats, "dist_stats": dist_stats,
                 "matches": matches, "q_p": q_p,
-                "quality_report": quality_report
+                "quality_report": quality_report,
+                "market_sentiment": market_sentiment
             }
             if enhanced_factor:
                 res_dict["enhanced_factor"] = enhanced_factor
@@ -674,6 +934,7 @@ if mode == "🔍 单只股票分析":
             趋势信号: {initial_action}
             形态胜率: {win_rate:.1f}%
             IC摘要: {ic_summary_txt}
+            市场情绪(沪深300): {market_sentiment.get('score', 'N/A')} | {market_sentiment.get('label', 'N/A')}
             --- 财务数据 ---
             ROE: {fund_data.get('roe')}%
             PE(TTM): {fund_data.get('pe_ttm')}
@@ -786,6 +1047,45 @@ if mode == "🔍 单只股票分析":
                         os.remove(heat_path)
         except Exception:
             pass
+
+        # 大盘情绪（后验，不影响匹配）
+        st.subheader("1.5 大盘情绪（沪深300，后验）")
+        with st.expander("ℹ️ 指标说明", expanded=False):
+            st.markdown("""
+            - 仅作为**后验补充特征**，不影响K线相似度排序
+            - 日频：1D/1W/4W涨跌幅、20日年化波动
+            - 周频：4周累计涨跌、8周波动
+            - 风险：近60日最大回撤、20日平均振幅
+            """)
+        sent = d.get("market_sentiment", {}) or {}
+        if not sent.get("ok"):
+            st.warning(f"⚠️ 大盘情绪暂不可用：{sent.get('error', '未知原因')}")
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("情绪指数", f"{sent.get('score', 0)}/100", sent.get("label", ""))
+            c2.metric("最新收盘", f"{sent.get('latest_close', 0):.2f}")
+            c3.metric("1D涨跌", f"{(sent.get('ret_1d') or 0) * 100:.2f}%")
+            c4.metric("1W涨跌", f"{(sent.get('ret_5d') or 0) * 100:.2f}%")
+
+            c5, c6, c7, c8 = st.columns(4)
+            c5.metric("4W涨跌", f"{(sent.get('ret_20d') or 0) * 100:.2f}%")
+            c6.metric("20D波动(年化)", f"{(sent.get('vol_20d') or 0) * 100:.2f}%")
+            c7.metric("60D最大回撤", f"{(sent.get('max_drawdown_60d') or 0) * 100:.2f}%")
+            c8.metric("量能比(20D)", f"{(sent.get('volume_ratio') or 0):.2f}")
+
+            with st.expander("📈 沪深300近120日走势", expanded=False):
+                if sent.get("series_dates") and sent.get("series_values"):
+                    fig_idx = go.Figure()
+                    fig_idx.add_trace(go.Scatter(
+                        x=sent["series_dates"],
+                        y=sent["series_values"],
+                        mode="lines",
+                        name="沪深300收盘"
+                    ))
+                    fig_idx.update_layout(height=260, margin=dict(l=10, r=10, t=30, b=10))
+                    st.plotly_chart(fig_idx, use_container_width=True)
+            st.caption(f"公式：{sent.get('formula')}")
+
         if d['trajs']:
             fig = go.Figure()
             for i, p in enumerate(d['trajs']):
@@ -961,8 +1261,20 @@ if mode == "🔍 单只股票分析":
             m1.metric("AI 总评分", f"{d['score']}/10", delta=d['act'])
             fund_ok = (d.get("fund", {}) or {}).get("_ok", {})
             pe_val = d['fund'].get('pe_ttm', 0)
-            m2.metric("ROE", f"{d['fund'].get('roe')}%" if fund_ok.get("finance") and d['fund'].get('roe', 0) > 0 else "N/A")
-            m3.metric("PE", f"{pe_val:.2f}" if pe_val > 0 else "N/A")
+            roe_val = d['fund'].get('roe', 0)
+            try:
+                pe_val = float(pe_val) if pe_val is not None else 0.0
+            except Exception:
+                pe_val = 0.0
+            try:
+                roe_val = float(roe_val) if roe_val is not None else 0.0
+            except Exception:
+                roe_val = 0.0
+            roe_valid = np.isfinite(roe_val) and roe_val != 0
+            pe_valid = np.isfinite(pe_val) and pe_val != 0
+            roe_suffix = "" if fund_ok.get("finance") else " (估)"
+            m2.metric("ROE", f"{roe_val:.2f}%{roe_suffix}" if roe_valid else "N/A")
+            m3.metric("PE", f"{pe_val:.2f}" if pe_valid else "N/A")
             m4.metric("趋势", "看涨" if d['df_f'].iloc[-1]['MA_Signal'] > 0 else "看跌")
 
             with st.expander("📊 杜邦分析 & 因子明细"):
@@ -1162,11 +1474,13 @@ if mode == "🔍 单只股票分析":
                 st.info("尚未检测到 IC 摘要，建议先运行「因子有效性分析」，再生成 AI 终审。")
             if st.button("生成 AI 终审", key="ai_final_btn"):
                 with st.spinner("AI 终审生成中..."):
-                    report = eng["agent"].analyze(
+                    report = _safe_ai_analyze(
+                        eng["agent"],
                         symbol, d["score"], d["act"],
                         {"win_rate": d.get("win", 50), "score": 0.9},
                         d["df_f"].iloc[-1].to_dict(), d["fund"], d["news"],
-                        ic_summary=ic_summary
+                        ic_summary=ic_summary,
+                        market_sentiment=d.get("market_sentiment")
                     )
                     st.session_state.ai_reports[symbol] = report
         if report is None:

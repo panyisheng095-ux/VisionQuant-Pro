@@ -4,6 +4,7 @@ import numpy as np
 import time
 import os
 import json
+import difflib
 from src.utils.net_utils import no_proxy_env
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -78,7 +79,7 @@ class FundamentalMiner:
         except Exception:
             pass
 
-    def get_stock_fundamentals(self, symbol):
+    def get_stock_fundamentals(self, symbol, force_live: bool = False):
         """
         获取深度财务指标 (含成长性与安全性分析)
         """
@@ -90,7 +91,9 @@ class FundamentalMiner:
             "symbol": symbol,
             # 默认不要用 symbol 当 name，否则 UI 会出现 “300286(300286)” 这种重复且掩盖抓取失败
             "name": "",
+            "industry": "",
             "pe_ttm": 0.0, "pb": 0.0, "total_mv": 0.0,
+            "net_profit": 0.0,
             "roe": 0.0, "net_profit_margin": 0.0, "asset_turnover": 0.6, "leverage": 1.0,
             "debt_asset_ratio": 0.0,
             # === 新增指标 ===
@@ -120,38 +123,54 @@ class FundamentalMiner:
 
                 def _pick_col(cols, keywords, prefer=None):
                     prefer = prefer or []
+                    prefer_groups = []
+                    for p in prefer:
+                        if isinstance(p, (list, tuple, set)):
+                            prefer_groups.append([str(x) for x in p])
+                        else:
+                            prefer_groups.append([str(p)])
                     for c in cols:
-                        if all(k in str(c) for k in prefer):
-                            return c
+                        for group in prefer_groups:
+                            if group and all(k in str(c) for k in group):
+                                return c
                     for c in cols:
                         if any(k in str(c) for k in keywords):
                             return c
                     return None
 
                 cols = list(target.columns)
-                pe_col = _pick_col(cols, ["市盈率", "PE", "pe", "TTM"], prefer=["市盈率", "TTM"])
-                pb_col = _pick_col(cols, ["市净率", "PB", "pb"])
-                mv_col = _pick_col(cols, ["总市值", "市值"])
+                pe_col = _pick_col(
+                    cols,
+                    ["市盈率", "PE", "pe", "TTM", "滚动", "动态"],
+                    prefer=[["市盈率", "TTM"], ["市盈率", "动"], ["PE", "TTM"]]
+                )
+                pb_col = _pick_col(cols, ["市净率", "PB", "pb", "市帐率", "P/B"])
+                mv_col = _pick_col(cols, ["总市值", "市值", "market", "MV"])
                 name_col = next((c for c in target.columns if '名称' in c), None)
+                ind_col = next((c for c in target.columns if '行业' in c), None)
 
                 updated = False
                 if pe_col:
                     pe_val = self._to_f(target[pe_col].values[0])
-                    if pe_val > 0:
+                    if self._is_valid_num(pe_val):
                         result["pe_ttm"] = pe_val
                         updated = True
                 if pb_col:
                     pb_val = self._to_f(target[pb_col].values[0])
-                    if pb_val > 0:
+                    if self._is_valid_num(pb_val):
                         result["pb"] = pb_val
                         updated = True
                 if mv_col:
                     mv_val = self._to_f(target[mv_col].values[0])
-                    if mv_val > 0:
+                    if self._is_valid_num(mv_val):
                         result["total_mv"] = round(mv_val / 100000000, 2)
                         updated = True
                 if name_col and not result.get("name"):
                     result["name"] = str(target[name_col].values[0]).strip()
+                if ind_col and not result.get("industry"):
+                    ind_val = str(target[ind_col].values[0]).strip()
+                    if ind_val and ind_val not in ["未知", "-"]:
+                        result["industry"] = ind_val
 
                 if updated:
                     result["_ok"]["spot"] = True
@@ -163,11 +182,11 @@ class FundamentalMiner:
         try:
             # 1. 实时估值
             try:
-                spot_df = self._get_spot_df_cached(result)
+                spot_df = self._get_spot_df_live(result) if force_live else self._get_spot_df_cached(result)
                 ok = _fill_from_spot(spot_df)
                 # 若未拿到有效估值，强制刷新一次
                 if not ok and (result.get("pe_ttm", 0) == 0 and result.get("pb", 0) == 0):
-                    spot_df = self._get_spot_df_cached(result, force_refresh=True)
+                    spot_df = self._get_spot_df_live(result) if force_live else self._get_spot_df_cached(result, force_refresh=True)
                     _fill_from_spot(spot_df)
             except Exception as e:
                 result["_err"].append(f"spot_df_error: {type(e).__name__}: {e}")
@@ -186,20 +205,44 @@ class FundamentalMiner:
                                     name_row = info_df[info_df["item"].astype(str).str.contains("股票简称|名称")]
                                     if not name_row.empty:
                                         result["name"] = str(name_row["value"].values[0]).strip()
+
+                                # 获取行业信息（用于后续行业对标，减少重复请求）
+                                try:
+                                    ind_row = info_df[info_df["item"].astype(str).str.contains("行业|所属行业")]
+                                    if not ind_row.empty:
+                                        industry_val = str(ind_row["value"].values[0]).strip()
+                                        if industry_val and industry_val not in ["未知", ""]:
+                                            result["industry"] = industry_val
+                                            self._industry_cache[symbol] = industry_val
+                                            if not force_live:
+                                                self._save_industry_cache()
+                                except Exception:
+                                    pass
                                 
                                 # 尝试获取PE/PB（如果spot_df没有获取到）
                                 if result.get("pe_ttm", 0) == 0:
-                                    pe_row = info_df[info_df["item"].astype(str).str.contains("市盈率|PE")]
+                                    pe_row = info_df[info_df["item"].astype(str).str.contains(
+                                        "市盈率|PE|滚动市盈率|TTM|动态市盈率", case=False, regex=True
+                                    )]
                                     if not pe_row.empty:
                                         result["pe_ttm"] = self._to_f(pe_row["value"].values[0])
                                 
                                 if result.get("pb", 0) == 0:
-                                    pb_row = info_df[info_df["item"].astype(str).str.contains("市净率|PB")]
+                                    pb_row = info_df[info_df["item"].astype(str).str.contains(
+                                        "市净率|PB|P/B", case=False, regex=True
+                                    )]
                                     if not pb_row.empty:
                                         result["pb"] = self._to_f(pb_row["value"].values[0])
+
+                                if result.get("total_mv", 0) == 0:
+                                    mv_row = info_df[info_df["item"].astype(str).str.contains(
+                                        "总市值|市值", case=False, regex=True
+                                    )]
+                                    if not mv_row.empty:
+                                        result["total_mv"] = round(self._to_f(mv_row["value"].values[0]) / 100000000, 2)
                                 
                                 # 如果获取到关键数据，退出重试循环
-                                if result.get("name") or result.get("pe_ttm", 0) > 0:
+                                if result.get("name") or self._is_valid_num(result.get("pe_ttm", 0)):
                                     break
                         if attempt < self._spot_retry:
                             time.sleep(0.5 * (attempt + 1))  # 指数退避
@@ -215,13 +258,13 @@ class FundamentalMiner:
                     extra = self._get_indicator_snapshot(symbol, max_retries=max(1, self._spot_retry))
                     if extra and extra.get("ok"):
                         updated = False
-                        if result.get("pe_ttm", 0) == 0 and extra.get("pe_ttm") is not None and extra.get("pe_ttm") > 0:
+                        if result.get("pe_ttm", 0) == 0 and extra.get("pe_ttm") is not None and self._is_valid_num(extra.get("pe_ttm")):
                             result["pe_ttm"] = extra.get("pe_ttm", 0.0)
                             updated = True
-                        if result.get("pb", 0) == 0 and extra.get("pb") is not None and extra.get("pb") > 0:
+                        if result.get("pb", 0) == 0 and extra.get("pb") is not None and self._is_valid_num(extra.get("pb")):
                             result["pb"] = extra.get("pb", 0.0)
                             updated = True
-                        if result.get("total_mv", 0) == 0 and extra.get("total_mv") is not None and extra.get("total_mv") > 0:
+                        if result.get("total_mv", 0) == 0 and extra.get("total_mv") is not None and self._is_valid_num(extra.get("total_mv")):
                             result["total_mv"] = extra.get("total_mv", 0.0)
                             updated = True
                         if updated:
@@ -259,6 +302,29 @@ class FundamentalMiner:
 
                         if 0 < result["debt_asset_ratio"] < 100:
                             result["leverage"] = round(1 / (1 - result["debt_asset_ratio"] / 100), 2)
+
+                        # 净利润（用于估算PE，若缺失）
+                        np_col = next((c for c in ths_df.columns if "归母净利润" in str(c) or "净利润" in str(c)), None)
+                        if np_col:
+                            np_val = self._to_f(latest.get(np_col))
+                            if self._is_valid_num(np_val):
+                                result["net_profit"] = round(np_val / 100000000, 2) if np_val > 1e6 else round(np_val, 2)
+
+                        # THS 数据中若包含估值字段，顺便补齐 PE/PB
+                        if result.get("pe_ttm", 0) == 0:
+                            pe_col = next((c for c in ths_df.columns if "市盈率" in str(c) or "PE" in str(c).upper()), None)
+                            if pe_col:
+                                pe_val = self._to_f(latest.get(pe_col))
+                                if self._is_valid_num(pe_val):
+                                    result["pe_ttm"] = pe_val
+                                    result["_ok"]["spot"] = True
+                        if result.get("pb", 0) == 0:
+                            pb_col = next((c for c in ths_df.columns if "市净率" in str(c) or "PB" in str(c).upper()), None)
+                            if pb_col:
+                                pb_val = self._to_f(latest.get(pb_col))
+                                if self._is_valid_num(pb_val):
+                                    result["pb"] = pb_val
+                                    result["_ok"]["spot"] = True
 
                         result["_ok"]["finance"] = True
                         ths_success = True
@@ -298,14 +364,44 @@ class FundamentalMiner:
                 except Exception:
                     pass
 
+            # 3.6 若 PE 仍缺失但已有市值与净利润，反推 PE（兜底）
+            if result.get("pe_ttm", 0) == 0 and result.get("total_mv", 0) > 0 and result.get("net_profit", 0) > 0:
+                try:
+                    result["pe_ttm"] = round(result["total_mv"] / (result["net_profit"] + 1e-8), 2)
+                    result["_ok"]["spot"] = True
+                    result["_err"].append("pe_estimated_by_mv_np")
+                except Exception:
+                    pass
+
+            # 3.7 统一总市值单位（亿元）
+            if self._is_valid_num(result.get("total_mv", 0), allow_zero=True):
+                try:
+                    mv_val = float(result.get("total_mv", 0))
+                    if mv_val > 1e6:
+                        result["total_mv"] = round(mv_val / 100000000, 2)
+                except Exception:
+                    pass
+
             # 4. 最终兜底：若估值字段已取得，补标 spot OK（只有真正获取到有效值才标记）
             if not result["_ok"]["spot"]:
-                if (result.get("pe_ttm", 0) > 0) or (result.get("pb", 0) > 0) or (result.get("total_mv", 0) > 0):
+                if (
+                    self._is_valid_num(result.get("pe_ttm", 0))
+                    or self._is_valid_num(result.get("pb", 0))
+                    or self._is_valid_num(result.get("total_mv", 0))
+                ):
                     result["_ok"]["spot"] = True
                 else:
                     # 如果所有估值字段都是0，明确标记为失败
                     if not result["_err"] or "spot_retry_failed" not in str(result["_err"]):
                         result["_err"].append("估值数据获取失败：PE/PB/市值均为0或不可用")
+
+            # 补齐行业信息（来自缓存/spot）
+            if not result.get("industry") and symbol in self._industry_cache:
+                result["industry"] = self._industry_cache.get(symbol)
+            if result.get("industry"):
+                self._industry_cache[symbol] = result.get("industry")
+                if not force_live:
+                    self._save_industry_cache()
 
         except Exception as e:
             result["_err"].append(f"spot_error: {type(e).__name__}: {e}")
@@ -355,8 +451,52 @@ class FundamentalMiner:
             except Exception:
                 pass
 
+        # 若强制刷新失败但已有内存缓存，直接回退内存缓存，避免PE/PB/行业同时缺失
+        if self._spot_cache_df is not None and not self._spot_cache_df.empty:
+            if last_err is not None:
+                result["_err"].append(f"spot_refresh_failed_use_cache: {type(last_err).__name__}: {last_err}")
+            self._spot_cache_ts = now
+            return self._spot_cache_df
+
         if last_err is not None:
             result["_err"].append(f"spot_retry_failed (尝试{max_retries}次): {type(last_err).__name__}: {last_err}")
+        return None
+
+    def _get_spot_df_live(self, result: dict):
+        """
+        强制实时拉取spot，不读写缓存。
+        """
+        last_err = None
+        max_retries = max(1, self._spot_retry + 1)
+        for i in range(max_retries):
+            try:
+                with no_proxy_env():
+                    df = ak.stock_zh_a_spot_em()
+                if df is None or df.empty:
+                    raise RuntimeError("spot_df_empty")
+                code_col = next((c for c in df.columns if '代码' in c), None)
+                if code_col:
+                    df[code_col] = df[code_col].astype(str).str.zfill(6)
+                return df
+            except Exception as e:
+                last_err = e
+                if i < max_retries - 1:
+                    time.sleep(0.5 * (i + 1))
+        # 若实时失败，尝试读取落盘缓存，避免PE/行业同时缺失
+        try:
+            if os.path.exists(self._spot_cache_path):
+                df = pd.read_csv(self._spot_cache_path)
+                if df is not None and not df.empty:
+                    code_col = next((c for c in df.columns if '代码' in c), None)
+                    if code_col:
+                        df[code_col] = df[code_col].astype(str).str.zfill(6)
+                    if last_err is not None:
+                        result["_err"].append(f"spot_live_failed_use_cache: {type(last_err).__name__}: {last_err}")
+                    return df
+        except Exception:
+            pass
+        if last_err is not None:
+            result["_err"].append(f"spot_live_failed (尝试{max_retries}次): {type(last_err).__name__}: {last_err}")
         return None
 
     def _get_indicator_snapshot(self, symbol: str, max_retries: int = 2):
@@ -364,6 +504,15 @@ class FundamentalMiner:
         估值指标兜底：尝试从 A 股指标接口提取 PE/PB/市值
         """
         symbol = str(symbol).strip().zfill(6)
+
+        def _symbol_variants(sym: str):
+            s = str(sym).strip().zfill(6)
+            variants = [s]
+            exchange = "SH" if s.startswith(("6", "9")) else "SZ"
+            variants.append(f"{s}.{exchange}")
+            variants.append(f"{exchange}{s}")
+            variants.append(f"{exchange.lower()}{s}")
+            return list(dict.fromkeys(variants))
 
         def _pick_col(df, keywords):
             cols = list(df.columns)
@@ -379,20 +528,29 @@ class FundamentalMiner:
         fetchers = []
         # 优先级1：最常用的接口
         if hasattr(ak, "stock_a_indicator_lg"):
-            fetchers.append(("stock_a_indicator_lg", lambda: ak.stock_a_indicator_lg(symbol=symbol)))
+            fetchers.append(("stock_a_indicator_lg", lambda s: ak.stock_a_indicator_lg(symbol=s), True))
         if hasattr(ak, "stock_zh_a_indicator"):
-            fetchers.append(("stock_zh_a_indicator", lambda: ak.stock_zh_a_indicator(symbol=symbol)))
+            fetchers.append(("stock_zh_a_indicator", lambda s: ak.stock_zh_a_indicator(symbol=s), True))
         if hasattr(ak, "stock_a_indicator"):
-            fetchers.append(("stock_a_indicator", lambda: ak.stock_a_indicator(symbol=symbol)))
+            fetchers.append(("stock_a_indicator", lambda s: ak.stock_a_indicator(symbol=s), True))
         # 优先级2：实时行情接口（作为最后兜底）
         if hasattr(ak, "stock_zh_a_spot_em"):
-            fetchers.append(("stock_zh_a_spot_em", lambda: ak.stock_zh_a_spot_em().query(f"代码 == '{symbol}'")))
+            fetchers.append(("stock_zh_a_spot_em", lambda s: ak.stock_zh_a_spot_em().query(f"代码 == '{symbol}'"), False))
 
-        for name, fetch in fetchers:
-            for attempt in range(max_retries):
-                try:
-                    with no_proxy_env():
-                        df = fetch()
+        symbol_variants = _symbol_variants(symbol)
+
+        for name, fetch, use_variant in fetchers:
+            symbols_to_try = symbol_variants if use_variant else [symbol]
+            for sym in symbols_to_try:
+                for attempt in range(max_retries):
+                    try:
+                        with no_proxy_env():
+                            df = fetch(sym)
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            time.sleep(0.5 * (attempt + 1))
+                            continue
+                        continue
                     if df is None or df.empty:
                         continue
                     # 如果是DataFrame，取第一行或最后一行
@@ -403,26 +561,38 @@ class FundamentalMiner:
                             continue
                     else:
                         continue
-                    
+
                     pe_col = _pick_col(df, ["pe_ttm", "市盈率", "PE", "TTM", "市盈率TTM"])
                     pb_col = _pick_col(df, ["pb", "市净率", "PB"])
                     mv_col = _pick_col(df, ["total_mv", "总市值", "市值", "流通市值", "market_cap"])
-                    
+
                     pe_ttm = self._to_f(latest.get(pe_col)) if pe_col and pe_col in latest.index else None
                     pb = self._to_f(latest.get(pb_col)) if pb_col and pb_col in latest.index else None
                     total_mv = self._to_f(latest.get(mv_col)) if mv_col and mv_col in latest.index else None
-                    
+                    if self._is_valid_num(total_mv, allow_zero=True):
+                        try:
+                            if float(total_mv) > 1e6:
+                                total_mv = float(total_mv) / 100000000
+                        except Exception:
+                            pass
+
                     # 只有真正获取到有效值才返回
-                    if pe_ttm and pe_ttm > 0:
-                        return {"pe_ttm": pe_ttm, "pb": pb if pb and pb > 0 else None, "total_mv": total_mv if total_mv and total_mv > 0 else None, "ok": True}
-                    if pb and pb > 0:
-                        return {"pe_ttm": None, "pb": pb, "total_mv": total_mv if total_mv and total_mv > 0 else None, "ok": True}
-                    if total_mv and total_mv > 0:
+                    if self._is_valid_num(pe_ttm):
+                        return {
+                            "pe_ttm": pe_ttm,
+                            "pb": pb if self._is_valid_num(pb) else None,
+                            "total_mv": total_mv if self._is_valid_num(total_mv) else None,
+                            "ok": True
+                        }
+                    if self._is_valid_num(pb):
+                        return {
+                            "pe_ttm": None,
+                            "pb": pb,
+                            "total_mv": total_mv if self._is_valid_num(total_mv) else None,
+                            "ok": True
+                        }
+                    if self._is_valid_num(total_mv):
                         return {"pe_ttm": None, "pb": None, "total_mv": total_mv, "ok": True}
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        time.sleep(0.5 * (attempt + 1))
-                        continue
         return None
 
     def _get_industry_board_names(self, max_retries: int = 2):
@@ -536,18 +706,18 @@ class FundamentalMiner:
 
     # ... (get_industry_peers, _find_val, _to_f 保持不变，直接复用原有的即可) ...
     # 为了完整性，这里简写保留辅助函数结构
-    def get_industry_peers(self, symbol, max_retries=3):
+    def get_industry_peers(self, symbol, max_retries=3, force_live: bool = False):
         """
         工业级优化：获取行业和同行对比数据
         添加重试机制和降级策略
         """
         symbol = str(symbol).strip().zfill(6)
-        if symbol in self._peers_cache:
+        if (not force_live) and symbol in self._peers_cache:
             cached_ind, cached_peers = self._peers_cache[symbol]
             if cached_peers is not None and len(cached_peers) >= 2 and cached_ind not in ["未知", "上海主板", "深圳主板", "创业板", "科创板", None]:
                 return self._peers_cache[symbol]
 
-        industry = self._industry_cache.get(symbol)
+        industry = None if force_live else self._industry_cache.get(symbol)
         # 1) 个股信息接口（可能不稳定）- 添加重试机制
         if not industry:
             for attempt in range(max_retries):
@@ -570,7 +740,7 @@ class FundamentalMiner:
 
         # 2) 使用缓存的全市场spot兜底
         dummy = {"_err": []}
-        spot_df = self._get_spot_df_cached(dummy)
+        spot_df = self._get_spot_df_live(dummy) if force_live else self._get_spot_df_cached(dummy)
         if not industry and spot_df is not None and not spot_df.empty:
             code_col = next((c for c in spot_df.columns if '代码' in c), None)
             ind_col = next((c for c in spot_df.columns if '行业' in c), None)
@@ -589,7 +759,7 @@ class FundamentalMiner:
             industry = {"60": "上海主板", "00": "深圳主板", "30": "创业板", "68": "科创板"}.get(prefix, "未知")
 
         # 保存行业缓存（落盘）
-        if industry and industry not in ["未知", "上海主板", "深圳主板", "创业板", "科创板"]:
+        if industry and industry not in ["未知", "上海主板", "深圳主板", "创业板", "科创板"] and not force_live:
             self._industry_cache[symbol] = industry
             self._save_industry_cache()
 
@@ -599,7 +769,7 @@ class FundamentalMiner:
             if spot_df is None or spot_df.empty:
                 # 尝试重新获取全市场数据（带重试）
                 dummy = {"_err": []}
-                full_market = self._get_spot_df_cached(dummy)
+                full_market = self._get_spot_df_live(dummy) if force_live else self._get_spot_df_cached(dummy)
                 if full_market is None or full_market.empty:
                     # 最后尝试直接调用（不带缓存）
                     for attempt in range(max_retries):
@@ -646,6 +816,20 @@ class FundamentalMiner:
                         for n in [board_name, norm, f"{norm}行业", f"{norm}板块"]:
                             if n and n not in board_candidates:
                                 board_candidates.append(n)
+                        # 模糊匹配行业名称（应对“计算机设备(申万)”等差异）
+                        try:
+                            names = self._get_industry_board_names()
+                            if names:
+                                for name in names:
+                                    if norm and norm in self._normalize_industry_name(name):
+                                        if name not in board_candidates:
+                                            board_candidates.append(name)
+                                close = difflib.get_close_matches(industry, names, n=5, cutoff=0.6)
+                                for name in close:
+                                    if name not in board_candidates:
+                                        board_candidates.append(name)
+                        except Exception:
+                            pass
 
                         cons_df = None
                         for bn in board_candidates:
@@ -711,25 +895,60 @@ class FundamentalMiner:
                 
                 # 成分股兜底：如果 full_market 匹配失败，直接使用行业成分股列表
                 if (peers_df.empty or len(peers_df) < 2) and cons_df_cached is not None and not cons_df_cached.empty:
-                    peers_df = cons_df_cached.copy()
-                    # 重新识别列名（针对成分股表）
-                    code_col = next((c for c in peers_df.columns if '代码' in c or '证券代码' in c or 'stock_code' in c), None)
-                    name_col = next((c for c in peers_df.columns if '名称' in c or '股票简称' in c or 'name' in str(c).lower()), None)
-                    pe_col = next((c for c in peers_df.columns if '市盈率' in c or 'PE' in str(c).upper()), None)
-                    pb_col = next((c for c in peers_df.columns if '市净率' in c or 'PB' in str(c).upper()), None)
-                    mkt_cap_col = next((c for c in peers_df.columns if '总市值' in c), None) or next((c for c in peers_df.columns if '市值' in c and '流通' not in c), None)
+                    # 如果成分股表有代码列，尝试从 full_market 中匹配获取完整数据
+                    cons_code_col = next((c for c in cons_df_cached.columns if '代码' in c or '证券代码' in c or 'stock_code' in c), None)
+                    if cons_code_col and code_col:
+                        cons_codes = cons_df_cached[cons_code_col].astype(str).str.zfill(6).tolist()
+                        if cons_codes:
+                            matched = full_market[full_market[code_col].isin(cons_codes)].copy()
+                            if not matched.empty:
+                                peers_df = matched
+                    # 如果还是空，直接使用成分股表（但需要重新识别列名）
+                    if peers_df.empty:
+                        peers_df = cons_df_cached.copy()
+                        # 重新识别列名（针对成分股表）
+                        code_col = next((c for c in peers_df.columns if '代码' in c or '证券代码' in c or 'stock_code' in c), None)
+                        name_col = next((c for c in peers_df.columns if '名称' in c or '股票简称' in c or 'name' in str(c).lower()), None)
+                        pe_col = next((c for c in peers_df.columns if '市盈率' in c or 'PE' in str(c).upper()), None)
+                        pb_col = next((c for c in peers_df.columns if '市净率' in c or 'PB' in str(c).upper()), None)
+                        mkt_cap_col = next((c for c in peers_df.columns if '总市值' in c), None) or next((c for c in peers_df.columns if '市值' in c and '流通' not in c), None)
 
-                # 最后兜底：至少返回当前股票的数据
+                # 最后兜底：如果行业匹配失败，至少返回市值相近的股票（排除当前股票）
                 if peers_df.empty and code_col:
-                    current_stock = full_market[full_market[code_col] == symbol].copy()
-                    if not current_stock.empty:
-                        peers_df = current_stock
+                    # 尝试按市值排序，取前10个（排除当前股票）
+                    if mkt_cap_col and mkt_cap_col in full_market.columns:
+                        candidates = full_market[full_market[code_col] != symbol].copy()
+                        if not candidates.empty:
+                            candidates = candidates.sort_values(by=mkt_cap_col, ascending=False).head(10)
+                            peers_df = candidates
+                            print(f"⚠️ [{symbol}] 行业匹配失败，使用市值前10作为对标（行业: {industry}）")
                 
                 if peers_df.empty:
                     print(f"⚠️ [{symbol}] 无法获取行业对标数据（行业: {industry}）")
                     return industry, pd.DataFrame()
+                
+                # 确保排除当前股票，且至少有2个同行
+                if code_col and code_col in peers_df.columns and len(peers_df) > 0:
+                    peers_df = peers_df[peers_df[code_col] != symbol].copy()
+                    if len(peers_df) < 2 and mkt_cap_col and mkt_cap_col in full_market.columns:
+                        # 如果同行太少，补充市值相近的股票
+                        candidates = full_market[full_market[code_col] != symbol].copy()
+                        if not candidates.empty:
+                            candidates = candidates.sort_values(by=mkt_cap_col, ascending=False).head(6)
+                            existing_codes = set(peers_df[code_col].tolist()) if code_col in peers_df.columns else set()
+                            candidates = candidates[~candidates[code_col].isin(existing_codes)]
+                            if len(candidates) > 0:
+                                peers_df = pd.concat([peers_df, candidates.head(6 - len(peers_df))], ignore_index=True)
 
-            if mkt_cap_col:
+            # 排除当前股票
+            if code_col and code_col in peers_df.columns:
+                peers_df = peers_df[peers_df[code_col] != symbol].copy()
+            
+            if peers_df.empty:
+                print(f"⚠️ [{symbol}] 排除当前股票后，无同行数据")
+                return industry, pd.DataFrame()
+            
+            if mkt_cap_col and mkt_cap_col in peers_df.columns:
                 peers_df = peers_df.sort_values(by=mkt_cap_col, ascending=False).head(6).copy()
             else:
                 peers_df = peers_df.head(6).copy()
@@ -767,8 +986,9 @@ class FundamentalMiner:
             comparison_df['ROE(推算%)'] = np.where(comparison_df['PE(动)'] > 0,
                                                    (comparison_df['PB'] / comparison_df['PE(动)'] * 100).round(2), 0.0)
 
-            self._industry_cache[symbol] = industry
-            self._peers_cache[symbol] = (industry, comparison_df)
+            if not force_live:
+                self._industry_cache[symbol] = industry
+                self._peers_cache[symbol] = (industry, comparison_df)
             return industry, comparison_df
         except Exception:
             return industry or "未知", pd.DataFrame()
@@ -778,9 +998,38 @@ class FundamentalMiner:
             if all(k in str(c) for k in keywords): return self._to_f(row[c])
         return 0.0
 
+    def _is_valid_num(self, val, allow_zero: bool = False) -> bool:
+        try:
+            if val is None:
+                return False
+            f = float(val)
+            if not np.isfinite(f):
+                return False
+            return True if allow_zero else f != 0
+        except Exception:
+            return False
+
     def _to_f(self, val):
         try:
-            if val is None or str(val) in ['-', 'nan', '']: return 0.0
-            return float(str(val).replace('%', '').replace(',', ''))
+            if val is None:
+                return 0.0
+            s = str(val).strip()
+            if not s:
+                return 0.0
+            if s in ['-', '--', '—', 'nan', 'NaN', 'N/A', 'NA', 'n/a', 'None', 'null', 'NULL']:
+                return 0.0
+            s = s.replace('元', '')
+            mult = 1.0
+            if s.endswith("万亿"):
+                mult = 1e12
+                s = s[:-2]
+            elif s.endswith("亿"):
+                mult = 1e8
+                s = s[:-1]
+            elif s.endswith("万"):
+                mult = 1e4
+                s = s[:-1]
+            s = s.replace('%', '').replace(',', '').replace('倍', '')
+            return float(s) * mult
         except:
             return 0.0

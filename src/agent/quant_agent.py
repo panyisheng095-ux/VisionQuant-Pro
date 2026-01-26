@@ -54,6 +54,9 @@ class QuantAgent:
         [舆情]
         {news_summary}
 
+        [市场情绪]
+        {market_sentiment}
+
         [因子有效性]
         {ic_summary}
 
@@ -69,7 +72,7 @@ class QuantAgent:
         self.prompt = PromptTemplate(
             template=template,
             input_variables=["symbol", "date", "total_score", "initial_action", "win_rate", "ma_trend", "rsi", "macd",
-                             "pe_ttm", "pb", "roe", "news_summary", "ic_summary"],
+                             "pe_ttm", "pb", "roe", "news_summary", "ic_summary", "market_sentiment"],
             partial_variables={"format_instructions": self.parser.get_format_instructions()}
         )
 
@@ -118,7 +121,7 @@ class QuantAgent:
             return True
         return self._init_llm()
 
-    def analyze(self, symbol, total_score, initial_action, visual_data, factor_data, fund_data, news_text="", ic_summary=None):
+    def analyze(self, symbol, total_score, initial_action, visual_data, factor_data, fund_data, news_text="", ic_summary=None, market_sentiment=None):
         if not self._ensure_llm():
             return self._fallback_result(f"API 连接失败: {self._last_error or '请检查网络或额度'}")
 
@@ -136,6 +139,18 @@ class QuantAgent:
         else:
             ic_text = "IC未计算或不可用（未运行因子有效性分析）"
 
+        if isinstance(market_sentiment, dict) and market_sentiment.get("ok"):
+            sentiment_text = (
+                f"沪深300情绪: {market_sentiment.get('score')}/100 ({market_sentiment.get('label')}) | "
+                f"1D: {round((market_sentiment.get('ret_1d') or 0) * 100, 2)}% | "
+                f"1W: {round((market_sentiment.get('ret_5d') or 0) * 100, 2)}% | "
+                f"4W: {round((market_sentiment.get('ret_20d') or 0) * 100, 2)}% | "
+                f"波动: {round((market_sentiment.get('vol_20d') or 0) * 100, 2)}% | "
+                f"回撤: {round((market_sentiment.get('max_drawdown_60d') or 0) * 100, 2)}%"
+            )
+        else:
+            sentiment_text = "市场情绪未获取或不可用"
+
         payload = {
             "symbol": symbol,
             "date": datetime.now().strftime("%Y-%m-%d"),
@@ -149,7 +164,8 @@ class QuantAgent:
             "pb": fund_data.get('pb', 0),
             "roe": fund_data.get('roe', 0),
             "news_summary": str(news_text)[:800],
-            "ic_summary": ic_text
+            "ic_summary": ic_text,
+            "market_sentiment": sentiment_text
         }
         # 工业级优化：增强重试机制和超时控制
         max_retries = 2
